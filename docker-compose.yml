@@ -1,0 +1,25 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      DATABASE_URL: file:/data/dev.db
+      PORT: 8787
+      DISCORD_OPERATIVE_CHANNEL_ID: ${DISCORD_OPERATIVE_CHANNEL_ID:-1471526846259527725}
+    ports:
+      - "8787:8787"
+    volumes:
+      - rca_data:/data
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+volumes:
+  rca_data:

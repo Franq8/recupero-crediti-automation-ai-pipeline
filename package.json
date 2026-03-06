@@ -1,0 +1,17 @@
+{
+  "name": "recupero-crediti-automation",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "dev": "npm run -w @rca/api dev",
+    "dev:api": "npm run -w @rca/api dev",
+    "dev:web": "npm run -w @rca/web dev",
+    "db:generate": "npm run -w @rca/api db:generate",
+    "db:migrate": "npm run -w @rca/api db:migrate"
+  }
+}

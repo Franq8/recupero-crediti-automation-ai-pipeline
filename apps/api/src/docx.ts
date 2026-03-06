@@ -1,0 +1,174 @@
+import JSZip from 'jszip';
+
+const XML_TARGETS = [
+  'word/document.xml',
+  'word/header1.xml',
+  'word/header2.xml',
+  'word/header3.xml',
+  'word/footer1.xml',
+  'word/footer2.xml',
+  'word/footer3.xml'
+];
+
+function xmlEscape(input: string) {
+  return input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function normalizeValue(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'boolean') return value ? 'SI' : 'NO';
+  return String(value);
+}
+
+function pick(map: Record<string, unknown>, ...keys: string[]) {
+  for (const k of keys) {
+    const v = map[k];
+    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+  }
+  return '';
+}
+
+function buildSubjectIdentity(prefix: 'creditore' | 'debitore', map: Record<string, unknown>): string {
+  const name = pick(map, `${prefix}_denominazione_nome`, `${prefix}_denominazione`);
+  const cf = pick(map, `${prefix}_cf`);
+  const piva = pick(map, `${prefix}_piva`);
+  if (!name) return '';
+
+  if (cf && piva) {
+    if (cf === piva) return `${name} (C.F./P.IVA ${cf})`;
+    return `${name} (C.F. ${cf} - P.IVA ${piva})`;
+  }
+  if (cf) return `${name} (C.F. ${cf})`;
+  if (piva) return `${name} (P.IVA ${piva})`;
+  return name;
+}
+
+function enrichComputedFields(map: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...map,
+    debitore_identificativo_completo: buildSubjectIdentity('debitore', map),
+    creditore_identificativo_completo: buildSubjectIdentity('creditore', map),
+    // compatibilità con placeholder testuale attuale nel template fornito
+    'denominazione debitore + c.f e/o p.iva': buildSubjectIdentity('debitore', map),
+    'denominazione creditore + c.f e/o p.iva': buildSubjectIdentity('creditore', map)
+  };
+}
+
+function extractMergeFieldName(instr: string): string | null {
+  const m = instr.match(/MERGEFIELD\s+"?([A-Za-z0-9_\.]+)"?/i);
+  return m?.[1] ?? null;
+}
+
+function replaceMustacheAndChevrons(xml: string, replacements: Record<string, string>) {
+  let out = xml;
+  for (const [key, value] of Object.entries(replacements)) {
+    out = out.replace(new RegExp(`\{\{\s*${key}\s*\}\}`, 'g'), value);
+    out = out.replace(new RegExp(`«\s*${key}\s*»`, 'g'), value);
+  }
+
+  // Placeholder composti stile [[...]]
+  out = out.replace(/\[\[\s*([^\]]+?)\s*\]\]/g, (_m, rawKey) => {
+    const exact = replacements[String(rawKey)];
+    if (exact !== undefined) return exact;
+    const norm = String(rawKey).toLowerCase().replace(/\s+/g, ' ').trim();
+    const found = Object.entries(replacements).find(([k]) => k.toLowerCase().replace(/\s+/g, ' ').trim() === norm);
+    return found ? found[1] : _m;
+  });
+
+  return out;
+}
+
+// Handles: <w:fldSimple w:instr=" MERGEFIELD fieldName ... "> ... <w:t>...</w:t> ... </w:fldSimple>
+function replaceFldSimple(xml: string, replacements: Record<string, string>) {
+  return xml.replace(/<w:fldSimple([^>]*)>([\s\S]*?)<\/w:fldSimple>/g, (full, attrs, inner) => {
+    const instrMatch = attrs.match(/w:instr="([^"]+)"/);
+    if (!instrMatch) return full;
+    const field = extractMergeFieldName(instrMatch[1]);
+    if (!field || !(field in replacements)) return full;
+
+    const val = replacements[field];
+    const patchedInner = inner.replace(/<w:t[^>]*>[\s\S]*?<\/w:t>/, `<w:t>${val}</w:t>`);
+    return `<w:fldSimple${attrs}>${patchedInner}</w:fldSimple>`;
+  });
+}
+
+// Handles complex MERGEFIELD with begin/instrText/separate/result/end
+function replaceComplexFieldRuns(xml: string, replacements: Record<string, string>) {
+  // paragraph-level heuristic: process each paragraph independently
+  return xml.replace(/<w:p[\s\S]*?<\/w:p>/g, (pXml) => {
+    const instrMatches = [...pXml.matchAll(/<w:instrText[^>]*>([\s\S]*?)<\/w:instrText>/g)];
+    if (!instrMatches.length) return pXml;
+
+    let out = pXml;
+    for (const im of instrMatches) {
+      const field = extractMergeFieldName(im[1]);
+      if (!field || !(field in replacements)) continue;
+      const val = replacements[field];
+
+      // from <w:fldChar w:fldCharType="separate"/> to <w:fldChar w:fldCharType="end"/>
+      out = out.replace(
+        /(<w:fldChar[^>]*w:fldCharType="separate"[^>]*\/>)([\s\S]*?)(<w:fldChar[^>]*w:fldCharType="end"[^>]*\/>)|(<w:fldChar[^>]*w:fldCharType="separate"[^>]*>\s*<\/w:fldChar>)([\s\S]*?)(<w:fldChar[^>]*w:fldCharType="end"[^>]*>\s*<\/w:fldChar>)/,
+        (...args) => {
+          const sepA = args[1] ?? args[4];
+          const endA = args[3] ?? args[6];
+          return `${sepA}<w:r><w:t>${val}</w:t></w:r>${endA}`;
+        }
+      );
+    }
+    return out;
+  });
+}
+
+export async function extractTemplateFields(docxBytes: Uint8Array): Promise<string[]> {
+  const zip = await JSZip.loadAsync(docxBytes);
+  const keys = new Set<string>();
+
+  for (const name of Object.keys(zip.files)) {
+    if (!name.startsWith('word/') || !name.endsWith('.xml')) continue;
+    const xml = await zip.file(name)?.async('text');
+    if (!xml) continue;
+
+    const mergeMatches = xml.matchAll(/MERGEFIELD\s+"?([A-Za-z0-9_\.]+)"?/g);
+    for (const m of mergeMatches) keys.add(m[1]);
+
+    const mustacheMatches = xml.matchAll(/\{\{\s*([A-Za-z0-9_\.]+)\s*\}\}/g);
+    for (const m of mustacheMatches) keys.add(m[1]);
+
+    const chevronMatches = xml.matchAll(/«\s*([A-Za-z0-9_\.]+)\s*»/g);
+    for (const m of chevronMatches) keys.add(m[1]);
+  }
+
+  return Array.from(keys).sort();
+}
+
+export async function renderDocxTemplate(
+  docxBytes: Uint8Array,
+  fieldMap: Record<string, unknown>
+): Promise<Uint8Array> {
+  const zip = await JSZip.loadAsync(docxBytes);
+
+  const enriched = enrichComputedFields(fieldMap);
+  const replacements = Object.fromEntries(
+    Object.entries(enriched).map(([k, v]) => [k, xmlEscape(normalizeValue(v))])
+  );
+
+  for (const fileName of XML_TARGETS) {
+    const file = zip.file(fileName);
+    if (!file) continue;
+
+    let xml = await file.async('text');
+    xml = replaceMustacheAndChevrons(xml, replacements);
+    xml = replaceFldSimple(xml, replacements);
+    xml = replaceComplexFieldRuns(xml, replacements);
+
+    zip.file(fileName, xml);
+  }
+
+  return zip.generateAsync({ type: 'uint8array' });
+}

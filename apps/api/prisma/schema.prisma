@@ -1,0 +1,89 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum FileKind {
+  PRACTICE_DOCUMENT
+  PRACTICE_IMPORT
+  TEMPLATE_DOCX
+}
+
+enum FieldStatus {
+  AUTO_OK
+  NEEDS_REVIEW
+  MANUAL
+  MISSING
+}
+
+model Practice {
+  id                 String       @id
+  caseType           String       @default("precetto_di")
+  schemaVer          String       @default("1.0.0")
+  selectedTemplateId String?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+  files              StoredFile[]
+  fieldValues        FieldValue[]
+  audits             AuditEvent[]
+}
+
+model StoredFile {
+  id          String    @id
+  practiceId  String?
+  practice    Practice? @relation(fields: [practiceId], references: [id], onDelete: Cascade)
+  kind        FileKind
+  filename    String
+  mimeType    String
+  sizeBytes   Int
+  sha256      String
+  content     Bytes
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model Template {
+  id          String   @id
+  name        String
+  version     Int      @default(1)
+  filename    String
+  mimeType    String
+  sizeBytes   Int
+  sha256      String
+  content     Bytes
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([name, isActive])
+}
+
+model FieldValue {
+  id            String      @id
+  practiceId    String
+  practice      Practice    @relation(fields: [practiceId], references: [id], onDelete: Cascade)
+  fieldKey      String
+  valueJson     String
+  sourceType    String
+  sourceRef     String?
+  confidence    Float?
+  status        FieldStatus @default(MISSING)
+  lastModifiedBy String
+  lastModifiedAt DateTime   @default(now())
+
+  @@unique([practiceId, fieldKey])
+}
+
+model AuditEvent {
+  id          String   @id
+  practiceId  String
+  practice    Practice @relation(fields: [practiceId], references: [id], onDelete: Cascade)
+  actor       String
+  action      String
+  payloadJson String
+  createdAt   DateTime @default(now())
+}
