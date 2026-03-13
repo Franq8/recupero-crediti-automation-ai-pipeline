@@ -1,5 +1,9 @@
 import JSZip from 'jszip';
-import { listTemplatePlaceholderKeys, replaceCanonicalPlaceholders } from './placeholder-grammar.js';
+import {
+  listTemplatePlaceholderKeys,
+  parseTemplatePlaceholders,
+  replaceCanonicalPlaceholders
+} from './placeholder-grammar.js';
 
 const XML_TARGETS = [
   'word/document.xml',
@@ -32,6 +36,14 @@ function extractMergeFieldName(instr: string): string | null {
   return m?.[1] ?? null;
 }
 
+type ParagraphTextNode = {
+  start: number;
+  end: number;
+  textStart: number;
+  textEnd: number;
+  text: string;
+};
+
 function replaceMustacheAndChevrons(xml: string, replacements: Record<string, string>) {
   let out = replaceCanonicalPlaceholders(xml, replacements);
   for (const [key, value] of Object.entries(replacements)) {
@@ -40,6 +52,96 @@ function replaceMustacheAndChevrons(xml: string, replacements: Record<string, st
     out = out.replace(new RegExp(`«\s*${escapedKey}\s*»`, 'g'), value);
   }
   return out;
+}
+
+function replaceCanonicalPlaceholdersInParagraphRuns(
+  paragraphXml: string,
+  replacements: Record<string, string>
+) {
+  const textNodeRegex = /<w:t([^>]*)>([\s\S]*?)<\/w:t>/g;
+  const nodes: ParagraphTextNode[] = [];
+  const pieces: string[] = [];
+
+  for (const match of paragraphXml.matchAll(textNodeRegex)) {
+    const attrs = match[1] ?? '';
+    const text = match[2] ?? '';
+    const full = match[0];
+    const start = match.index ?? 0;
+    const openTag = `<w:t${attrs}>`;
+    const textStart = start + openTag.length;
+    const textEnd = textStart + text.length;
+    nodes.push({ start, end: start + full.length, textStart, textEnd, text });
+    pieces.push(text);
+  }
+
+  if (!nodes.length) return paragraphXml;
+
+  const paragraphText = pieces.join('');
+  const placeholders = parseTemplatePlaceholders(paragraphText)
+    .map((item) => ({
+      raw: item.raw,
+      value: replacements[item.key] ?? replacements[
+        Object.keys(replacements).find((key) => key.toLowerCase().trim() === item.key.toLowerCase().trim()) ?? ''
+      ]
+    }))
+    .filter((item): item is { raw: string; value: string } => typeof item.value === 'string');
+
+  if (!placeholders.length) return paragraphXml;
+
+  const ops: Array<{ start: number; end: number; value: string }> = [];
+  let searchFrom = 0;
+  for (const item of placeholders) {
+    const start = paragraphText.indexOf(item.raw, searchFrom);
+    if (start === -1) continue;
+    ops.push({ start, end: start + item.raw.length, value: item.value });
+    searchFrom = start + item.raw.length;
+  }
+
+  if (!ops.length) return paragraphXml;
+
+  const charToNodeIndex: number[] = [];
+  let cursor = 0;
+  nodes.forEach((node, nodeIndex) => {
+    for (let i = 0; i < node.text.length; i += 1) charToNodeIndex[cursor + i] = nodeIndex;
+    cursor += node.text.length;
+  });
+
+  const replacementsByNode = nodes.map((node) => node.text);
+  for (let i = ops.length - 1; i >= 0; i -= 1) {
+    const op = ops[i];
+    const startNodeIndex = charToNodeIndex[op.start];
+    const endNodeIndex = charToNodeIndex[op.end - 1];
+    if (startNodeIndex === undefined || endNodeIndex === undefined) continue;
+
+    const startNodeBase = nodes.slice(0, startNodeIndex).reduce((sum, node) => sum + node.text.length, 0);
+    const endNodeBase = nodes.slice(0, endNodeIndex).reduce((sum, node) => sum + node.text.length, 0);
+    const startOffset = op.start - startNodeBase;
+    const endOffset = op.end - endNodeBase;
+
+    const prefix = replacementsByNode[startNodeIndex].slice(0, startOffset);
+    const suffix = replacementsByNode[endNodeIndex].slice(endOffset);
+    replacementsByNode[startNodeIndex] = `${prefix}${op.value}${suffix}`;
+    for (let nodeIndex = startNodeIndex + 1; nodeIndex <= endNodeIndex; nodeIndex += 1) {
+      replacementsByNode[nodeIndex] = '';
+    }
+  }
+
+  let out = paragraphXml;
+  for (let i = nodes.length - 1; i >= 0; i -= 1) {
+    const node = nodes[i];
+    out = `${out.slice(0, node.textStart)}${replacementsByNode[i]}${out.slice(node.textEnd)}`;
+  }
+
+  return out;
+}
+
+export function replaceCanonicalPlaceholdersPreservingDocxRuns(
+  xml: string,
+  replacements: Record<string, string>
+) {
+  return xml.replace(/<w:p[\s\S]*?<\/w:p>/g, (paragraphXml) =>
+    replaceCanonicalPlaceholdersInParagraphRuns(paragraphXml, replacements)
+  );
 }
 
 // Handles: <w:fldSimple w:instr=" MERGEFIELD fieldName ... "> ... <w:t>...</w:t> ... </w:fldSimple>
@@ -122,6 +224,7 @@ export async function renderDocxTemplate(
     if (!file) continue;
 
     let xml = await file.async('text');
+    xml = replaceCanonicalPlaceholdersPreservingDocxRuns(xml, replacements);
     xml = replaceMustacheAndChevrons(xml, replacements);
     xml = replaceFldSimple(xml, replacements);
     xml = replaceComplexFieldRuns(xml, replacements);
