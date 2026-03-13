@@ -16,6 +16,6 @@ Da questo punto il progetto è in **V1 freeze**: no nuove feature, solo stabiliz
 - [ ] Confermare convenzione conteggio giorni interessi `simple` (inclusivo/esclusivo)
 
 ### C) Chiusura operativa
-- [ ] Eseguire `smoke` e `smoke:discord` su ambiente target
+- [ ] Eseguire smoke tecnici su ambiente target
 - [ ] Verificare `GET /project/go-live-report`
 - [ ] Confermare go-live oppure congelare in stato pre-go-live

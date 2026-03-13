@@ -20,30 +20,65 @@ enum FieldStatus {
   MISSING
 }
 
+enum WorkingMode {
+  STANDARD_DOCUMENT_SET
+  DETERMINISTIC_TABLE_FIRST
+}
+
+enum RowStatus {
+  READY
+  NEEDS_REVIEW
+  OUTPUT_GENERATED
+}
+
+enum ReviewState {
+  TODO
+  IN_REVIEW
+  APPROVED
+}
+
 model Practice {
   id                 String       @id
   caseType           String       @default("precetto_di")
   schemaVer          String       @default("1.0.0")
   selectedTemplateId String?
+  workingMode        WorkingMode  @default(STANDARD_DOCUMENT_SET)
   createdAt          DateTime     @default(now())
   updatedAt          DateTime     @updatedAt
   files              StoredFile[]
   fieldValues        FieldValue[]
+  tableRows          TableRow[]
+  documentSets       DocumentSet[]
   audits             AuditEvent[]
 }
 
+model DocumentSet {
+  id          String      @id
+  practiceId  String
+  practice    Practice    @relation(fields: [practiceId], references: [id], onDelete: Cascade)
+  label       String
+  noteText    String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  files       StoredFile[]
+  tableRows   TableRow[]
+}
+
 model StoredFile {
-  id          String    @id
-  practiceId  String?
-  practice    Practice? @relation(fields: [practiceId], references: [id], onDelete: Cascade)
-  kind        FileKind
-  filename    String
-  mimeType    String
-  sizeBytes   Int
-  sha256      String
-  content     Bytes
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  id            String       @id
+  practiceId    String?
+  practice      Practice?    @relation(fields: [practiceId], references: [id], onDelete: Cascade)
+  documentSetId String?
+  documentSet   DocumentSet? @relation(fields: [documentSetId], references: [id], onDelete: SetNull)
+  kind          FileKind
+  filename      String
+  mimeType      String
+  sizeBytes     Int
+  sha256        String
+  content       Bytes
+  noteText      String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
 }
 
 model Template {
@@ -76,6 +111,25 @@ model FieldValue {
   lastModifiedAt DateTime   @default(now())
 
   @@unique([practiceId, fieldKey])
+}
+
+model TableRow {
+  id           String       @id
+  practiceId   String
+  practice     Practice     @relation(fields: [practiceId], references: [id], onDelete: Cascade)
+  rowIndex     Int
+  source       String
+  originMode   WorkingMode  @default(STANDARD_DOCUMENT_SET)
+  sourceSetId  String?
+  sourceSet    DocumentSet? @relation(fields: [sourceSetId], references: [id], onDelete: SetNull)
+  valuesJson   String
+  status       RowStatus    @default(READY)
+  reviewState  ReviewState  @default(TODO)
+  qualityScore Int?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  @@unique([practiceId, rowIndex])
 }
 
 model AuditEvent {

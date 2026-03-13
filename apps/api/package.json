@@ -10,7 +10,8 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "smoke": "node scripts/e2e-smoke.mjs",
-    "smoke:discord": "node scripts/e2e-discord.mjs"
+    "smoke:table": "node scripts/e2e-table.mjs",
+    "smoke:discord-v1": "node scripts/e2e-discord-v1.mjs"
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",

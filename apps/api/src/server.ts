@@ -3,16 +3,28 @@ import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import sensible from '@fastify/sensible';
 import { customAlphabet } from 'nanoid';
-import { readFile } from 'node:fs/promises';
 import { prisma } from './prisma.js';
 import { createPracticeSchema, uploadTemplateSchema, upsertFieldSchema } from './schemas.js';
 import { sha256 } from './utils.js';
-import { FileKind, FieldStatus } from '@prisma/client';
-import { extractPrecettoFieldsDetailed, extractTextByMime } from './extractor.js';
+import { FileKind, FieldStatus, WorkingMode, RowStatus, ReviewState } from '@prisma/client';
+import { extractTextByMime } from './document-content.js';
 import { extractTemplateFields, renderDocxTemplate } from './docx.js';
-import { parseDiscordPrecettoMessage } from './discord-parser.js';
-import { parseImportFile } from './importer.js';
-import { buildImportTemplateCsv, buildImportTemplateJson, buildImportTemplateXlsx } from './template-download.js';
+import { extractTemplateInstructions } from './template-instructions.js';
+import { buildPromptFlows } from './prompt-pack.js';
+import { parseImportFileRows } from './importer.js';
+import {
+  buildTemplateTableStructureCsv,
+  buildTemplateTableStructureJson,
+  buildTemplateTableStructureXlsx
+} from './template-table-structure.js';
+import { runOpenClawPipeline } from './openclaw-runner.js';
+import {
+  buildDiscordV1FinalSummary,
+  buildDiscordV1ReportMarkdown,
+  buildDiscordV1SummaryCsv,
+  buildDiscordV1Zip,
+  classifyDiscordV1Attachments
+} from './discord-v1.js';
 
 const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ', 10);
 const app = Fastify({ logger: true });
@@ -21,12 +33,6 @@ await app.register(cors, { origin: true });
 await app.register(sensible);
 await app.register(multipart, { limits: { fileSize: 50 * 1024 * 1024 } });
 
-const DISCORD_OPERATIVE_CHANNEL_ID = process.env.DISCORD_OPERATIVE_CHANNEL_ID ?? '';
-
-function requireOperativeChannel(channelId?: string) {
-  if (!DISCORD_OPERATIVE_CHANNEL_ID) return true;
-  return channelId === DISCORD_OPERATIVE_CHANNEL_ID;
-}
 
 function toFieldMap(rows: Array<{ fieldKey: string; valueJson: string }>) {
   return Object.fromEntries(rows.map((f) => [f.fieldKey, JSON.parse(f.valueJson)]));
@@ -36,9 +42,86 @@ function emptyValue(v: unknown) {
   return v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
 }
 
+function normalizeImportRow(row: Record<string, unknown>) {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(row)) {
+    if (!k || k === 'schema_version' || k === 'row_id') continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function buildTableWarnings(values: Record<string, unknown>) {
+  const missingKeys = Object.entries(values)
+    .filter(([, v]) => emptyValue(v))
+    .map(([k]) => k);
+
+  return {
+    missingKeys,
+    warnings: missingKeys.length
+      ? [{ code: 'PARTIAL_COVERAGE', level: 'warning', message: `Campi ancora vuoti: ${missingKeys.join(', ')}` }]
+      : []
+  };
+}
+
+async function getTemplateWorkflowShape(templateId: string) {
+  const tpl = await prisma.template.findUnique({ where: { id: templateId } });
+  if (!tpl) return null;
+
+  const fieldKeys = await extractTemplateFields(tpl.content);
+  const instructions = await extractTemplateInstructions(tpl.content);
+  const specialInstructions = instructions.filter((item) => item.kind === 'derive' || item.kind === 'generate');
+  const instructionKeys = instructions.map((item) => item.key);
+  const seen = new Set<string>();
+  const templateKeys: string[] = [];
+  for (const key of [...fieldKeys, ...instructionKeys]) {
+    const normalized = String(key ?? '').trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    templateKeys.push(normalized);
+  }
+
+  return {
+    template: tpl,
+    fieldKeys,
+    instructions,
+    templateKeys,
+    hasSpecialPlaceholders: specialInstructions.length > 0,
+    specialInstructions
+  };
+}
+
+async function upsertPracticeFieldsFromRow(practiceId: string, row: Record<string, unknown>, actor: string, sourceRef: string) {
+  const entries = Object.entries(normalizeImportRow(row));
+  for (const [fieldKey, value] of entries) {
+    await prisma.fieldValue.upsert({
+      where: { practiceId_fieldKey: { practiceId, fieldKey } },
+      create: {
+        id: crypto.randomUUID(),
+        practiceId,
+        fieldKey,
+        valueJson: JSON.stringify(value),
+        sourceType: 'import',
+        sourceRef,
+        confidence: 1,
+        status: emptyValue(value) ? FieldStatus.MISSING : FieldStatus.MANUAL,
+        lastModifiedBy: actor
+      },
+      update: {
+        valueJson: JSON.stringify(value),
+        sourceType: 'import',
+        sourceRef,
+        confidence: 1,
+        status: emptyValue(value) ? FieldStatus.MISSING : FieldStatus.MANUAL,
+        lastModifiedBy: actor,
+        lastModifiedAt: new Date()
+      }
+    });
+  }
+  return entries.length;
+}
 
 app.get('/health', async () => ({ ok: true }));
-
 
 app.get('/project/go-live-report', async () => {
   const practices = await prisma.practice.count();
@@ -54,16 +137,16 @@ app.get('/project/go-live-report', async () => {
     importXlsxCsvJson: true,
     docxGeneration: true,
     qualityAndFinalReports: true,
-    discordAdapterV1: true,
     dockerPackaging: true,
     smokeCore: true,
-    smokeDiscord: true
+    smokeTable: true
   };
 
   const hardChecks = {
     buildOk: true,
     auditVulnerabilitiesZero: true,
-    policyOpenClawOnly: true
+    policyOpenClawOnly: true,
+    noLegacyDiscordRuntime: true
   };
 
   const done = Object.values(capabilities).filter(Boolean).length;
@@ -99,9 +182,9 @@ app.get('/project/readiness', async () => {
     extractionOpenClawEntrypoint: true,
     importTemplates: true,
     auditTimeline: true,
-    discordV1: true,
     dockerSetup: true,
-    smokeTests: true
+    smokeTests: true,
+    legacyDiscordPurged: true
   };
 
   const done = Object.values(checklist).filter(Boolean).length;
@@ -151,6 +234,7 @@ app.get('/practices', async () => {
       caseType: true,
       schemaVer: true,
       selectedTemplateId: true,
+      workingMode: true,
       createdAt: true,
       updatedAt: true
     }
@@ -164,7 +248,7 @@ app.get('/practices/:id/export-state.json', async (request, reply) => {
   const practice = await prisma.practice.findUnique({
     where: { id },
     include: {
-      files: { select: { id: true, filename: true, kind: true, mimeType: true, sizeBytes: true, createdAt: true } },
+      files: { select: { id: true, filename: true, kind: true, mimeType: true, sizeBytes: true, noteText: true, documentSetId: true, createdAt: true } },
       fieldValues: true,
       audits: { orderBy: { createdAt: 'asc' } }
     }
@@ -194,7 +278,8 @@ app.post('/practices/import-state', async (request, reply) => {
       id,
       caseType: incoming.caseType ?? 'precetto_di',
       schemaVer: incoming.schemaVer ?? '1.0.0',
-      selectedTemplateId: incoming.selectedTemplateId ?? null
+      selectedTemplateId: incoming.selectedTemplateId ?? null,
+      workingMode: incoming.workingMode ?? 'STANDARD_DOCUMENT_SET'
     }
   });
 
@@ -233,8 +318,9 @@ app.get('/practices/:id', async (request, reply) => {
   const practice = await prisma.practice.findUnique({
     where: { id },
     include: {
-      files: { select: { id: true, filename: true, kind: true, createdAt: true, sizeBytes: true } },
+      files: { select: { id: true, filename: true, kind: true, createdAt: true, sizeBytes: true, noteText: true, documentSetId: true } },
       fieldValues: true,
+      documentSets: { orderBy: { createdAt: 'asc' }, include: { files: { select: { id: true, filename: true, noteText: true, kind: true, createdAt: true } } } },
       audits: { orderBy: { createdAt: 'desc' }, take: 200 }
     }
   });
@@ -243,30 +329,111 @@ app.get('/practices/:id', async (request, reply) => {
   return { ok: true, data: practice };
 });
 
+app.post('/practices/:id/mode', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const body = (request.body ?? {}) as { mode?: string; actor?: string };
+  const mode = String(body.mode ?? '').toUpperCase();
+  const nextMode = mode === 'DETERMINISTIC_TABLE_FIRST' ? WorkingMode.DETERMINISTIC_TABLE_FIRST : mode === 'STANDARD_DOCUMENT_SET' ? WorkingMode.STANDARD_DOCUMENT_SET : null;
+  if (!nextMode) return reply.badRequest('mode must be STANDARD_DOCUMENT_SET or DETERMINISTIC_TABLE_FIRST');
 
+  const practice = await prisma.practice.update({ where: { id }, data: { workingMode: nextMode } });
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      actor: body.actor ?? 'user',
+      action: 'WORKING_MODE_UPDATED',
+      payloadJson: JSON.stringify({ mode: nextMode })
+    }
+  });
 
-app.get('/import-template/:format', async (request, reply) => {
-  const { format } = request.params as { format: string };
+  return { ok: true, data: { practiceId: id, workingMode: practice.workingMode } };
+});
+
+app.get('/practices/:id/document-sets', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const sets = await prisma.documentSet.findMany({
+    where: { practiceId: id },
+    orderBy: { createdAt: 'asc' },
+    include: { files: { select: { id: true, filename: true, kind: true, noteText: true, createdAt: true } } }
+  });
+  return { ok: true, data: sets };
+});
+
+app.post('/practices/:id/document-sets', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const body = (request.body ?? {}) as { label?: string; noteText?: string; actor?: string };
+  const label = (body.label ?? '').trim() || `Set ${new Date().toISOString().slice(0, 19)}`;
+  const set = await prisma.documentSet.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      label,
+      noteText: (body.noteText ?? '').trim() || null
+    }
+  });
+
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      actor: body.actor ?? 'user',
+      action: 'DOCUMENT_SET_CREATED',
+      payloadJson: JSON.stringify({ documentSetId: set.id, label })
+    }
+  });
+
+  return { ok: true, data: set };
+});
+
+app.post('/practices/:id/document-sets/:setId/files/:fileId/attach', async (request, reply) => {
+  const { id, setId, fileId } = request.params as { id: string; setId: string; fileId: string };
+  const body = (request.body ?? {}) as { actor?: string };
+  const file = await prisma.storedFile.findFirst({ where: { id: fileId, practiceId: id } });
+  if (!file) return reply.notFound('File not found');
+  const set = await prisma.documentSet.findFirst({ where: { id: setId, practiceId: id } });
+  if (!set) return reply.notFound('Document set not found');
+
+  const updated = await prisma.storedFile.update({ where: { id: fileId }, data: { documentSetId: setId } });
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      actor: body.actor ?? 'user',
+      action: 'DOCUMENT_SET_FILE_ATTACHED',
+      payloadJson: JSON.stringify({ documentSetId: setId, fileId })
+    }
+  });
+
+  return { ok: true, data: { fileId: updated.id, documentSetId: updated.documentSetId } };
+});
+
+app.get('/templates/:id/table-structure/:format', async (request, reply) => {
+  const { id, format } = request.params as { id: string; format: string };
+  const tpl = await prisma.template.findUnique({ where: { id } });
+  if (!tpl) return reply.notFound('Template not found. The selected template may have been removed or disabled.');
+
   const f = format.toLowerCase();
+  const safeBaseName = `${tpl.name.replace(/[^a-z0-9_-]+/gi, '_')}_table_structure_v${tpl.version}`;
 
   if (f === 'json') {
-    const json = buildImportTemplateJson();
+    const json = await buildTemplateTableStructureJson(tpl.content);
     reply.header('content-type', 'application/json; charset=utf-8');
-    reply.header('content-disposition', 'attachment; filename="template_precetto_v1.json"');
+    reply.header('content-disposition', `attachment; filename="${safeBaseName}.json"`);
     return json;
   }
 
   if (f === 'csv') {
-    const csv = buildImportTemplateCsv();
+    const csv = await buildTemplateTableStructureCsv(tpl.content);
     reply.header('content-type', 'text/csv; charset=utf-8');
-    reply.header('content-disposition', 'attachment; filename="template_precetto_v1.csv"');
+    reply.header('content-disposition', `attachment; filename="${safeBaseName}.csv"`);
     return csv;
   }
 
   if (f === 'xlsx') {
-    const xlsx = await buildImportTemplateXlsx();
+    const xlsx = await buildTemplateTableStructureXlsx(tpl.content);
     reply.header('content-type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    reply.header('content-disposition', 'attachment; filename="template_precetto_v1.xlsx"');
+    reply.header('content-disposition', `attachment; filename="${safeBaseName}.xlsx"`);
     return Buffer.from(xlsx);
   }
 
@@ -284,34 +451,41 @@ app.post('/practices/:id/import', async (request, reply) => {
   const actor = (mp.fields as any).actor?.value?.toString() ?? 'user';
   const buf = await mp.toBuffer();
 
-  const imported = await parseImportFile(mp.filename, mp.mimetype, buf);
-  const entries = Object.entries(imported).filter(([k]) => k && k !== 'schema_version');
+  const rows = await parseImportFileRows(mp.filename, mp.mimetype, buf);
+  if (!rows.length) return reply.badRequest('Import file has no data rows.');
 
-  for (const [fieldKey, value] of entries) {
-    await prisma.fieldValue.upsert({
-      where: { practiceId_fieldKey: { practiceId: id, fieldKey } },
+  await prisma.tableRow.deleteMany({ where: { practiceId: id, source: 'import-batch' } });
+
+  for (let idx = 0; idx < rows.length; idx++) {
+    const sourceRow = rows[idx] as Record<string, unknown>;
+    const rowIdRaw = sourceRow.row_id;
+    const rowIndex = Number.isFinite(Number(rowIdRaw)) ? Number(rowIdRaw) : idx + 1;
+    const normalized = normalizeImportRow(sourceRow);
+
+    await prisma.tableRow.upsert({
+      where: { practiceId_rowIndex: { practiceId: id, rowIndex } },
       create: {
         id: crypto.randomUUID(),
         practiceId: id,
-        fieldKey,
-        valueJson: JSON.stringify(value),
-        sourceType: 'import',
-        sourceRef: mp.filename,
-        confidence: 1,
-        status: emptyValue(value) ? FieldStatus.MISSING : FieldStatus.MANUAL,
-        lastModifiedBy: actor
+        rowIndex,
+        source: 'import-batch',
+        originMode: WorkingMode.DETERMINISTIC_TABLE_FIRST,
+        valuesJson: JSON.stringify(normalized),
+        status: RowStatus.READY,
+        reviewState: ReviewState.TODO
       },
       update: {
-        valueJson: JSON.stringify(value),
-        sourceType: 'import',
-        sourceRef: mp.filename,
-        confidence: 1,
-        status: emptyValue(value) ? FieldStatus.MISSING : FieldStatus.MANUAL,
-        lastModifiedBy: actor,
-        lastModifiedAt: new Date()
+        source: 'import-batch',
+        originMode: WorkingMode.DETERMINISTIC_TABLE_FIRST,
+        valuesJson: JSON.stringify(normalized),
+        status: RowStatus.READY,
+        reviewState: ReviewState.TODO,
+        updatedAt: new Date()
       }
     });
   }
+
+  const activeEntriesCount = await upsertPracticeFieldsFromRow(id, rows[0] as Record<string, unknown>, actor, mp.filename);
 
   await prisma.storedFile.create({
     data: {
@@ -332,11 +506,19 @@ app.post('/practices/:id/import', async (request, reply) => {
       practiceId: id,
       actor,
       action: 'IMPORT_FILE_APPLIED',
-      payloadJson: JSON.stringify({ filename: mp.filename, importedFields: entries.map(([k]) => k) })
+      payloadJson: JSON.stringify({ filename: mp.filename, importedRows: rows.length, activeFields: activeEntriesCount })
     }
   });
 
-  return { ok: true, data: { importedFields: entries.length, filename: mp.filename } };
+  return {
+    ok: true,
+    data: {
+      filename: mp.filename,
+      importedRows: rows.length,
+      activeFields: activeEntriesCount,
+      activeRowIndex: 1
+    }
+  };
 });
 
 app.post('/practices/:id/files', async (request, reply) => {
@@ -351,6 +533,7 @@ app.post('/practices/:id/files', async (request, reply) => {
   const kindRaw = fields.kind?.value?.toString() ?? 'PRACTICE_DOCUMENT';
   const kind = FileKind[kindRaw as keyof typeof FileKind] ?? FileKind.PRACTICE_DOCUMENT;
   const actor = fields.actor?.value?.toString() ?? 'user';
+  const documentSetId = fields.documentSetId?.value?.toString() || null;
 
   const buf = await mp.toBuffer();
   const record = await prisma.storedFile.create({
@@ -362,7 +545,8 @@ app.post('/practices/:id/files', async (request, reply) => {
       mimeType: mp.mimetype,
       sizeBytes: buf.length,
       sha256: sha256(buf),
-      content: new Uint8Array(buf)
+      content: new Uint8Array(buf),
+      documentSetId
     }
   });
 
@@ -377,6 +561,30 @@ app.post('/practices/:id/files', async (request, reply) => {
   });
 
   return { ok: true, data: { id: record.id, filename: record.filename, kind: record.kind, sizeBytes: record.sizeBytes } };
+});
+
+app.post('/practices/:id/files/:fileId/note', async (request, reply) => {
+  const { id, fileId } = request.params as { id: string; fileId: string };
+  const body = (request.body ?? {}) as { note?: string; actor?: string };
+  const file = await prisma.storedFile.findFirst({ where: { id: fileId, practiceId: id } });
+  if (!file) return reply.notFound('File not found');
+
+  const updated = await prisma.storedFile.update({
+    where: { id: fileId },
+    data: { noteText: (body.note ?? '').trim() || null }
+  });
+
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      actor: body.actor ?? 'user',
+      action: 'FILE_NOTE_UPDATED',
+      payloadJson: JSON.stringify({ fileId, hasNote: !!updated.noteText })
+    }
+  });
+
+  return { ok: true, data: { fileId: updated.id, noteText: updated.noteText } };
 });
 
 app.get('/practices/:id/files/:fileId/download', async (request, reply) => {
@@ -467,47 +675,333 @@ app.post('/practices/:id/select-template', async (request, reply) => {
 
 app.get('/practices/:id/extract-openclaw-payload', async (request, reply) => {
   const { id } = request.params as { id: string };
-  const practice = await prisma.practice.findUnique({ where: { id }, include: { files: true } });
+  const practice = await prisma.practice.findUnique({ where: { id }, include: { files: true }, });
   if (!practice) return reply.notFound('Practice not found');
 
-  const docs = practice.files.filter((f) => f.kind === FileKind.PRACTICE_DOCUMENT);
+  const targetDocumentSetId = String((request.query as any)?.documentSetId ?? '');
+  const docs = practice.files.filter((f) => f.kind === FileKind.PRACTICE_DOCUMENT && (!targetDocumentSetId || f.documentSetId === targetDocumentSetId));
   if (!docs.length) return reply.badRequest('No practice documents uploaded. Upload at least one PDF/DOCX before extraction.');
 
-  const excerpts: Array<{ fileId: string; filename: string; text: string }> = [];
-  for (const f of docs.slice(0, 5)) {
+  const templateId = String((request.query as any)?.templateId ?? practice.selectedTemplateId ?? '');
+  if (!templateId) return reply.badRequest('No template selected for practice.');
+  const tpl = await prisma.template.findUnique({ where: { id: templateId } });
+  if (!tpl) return reply.notFound('Template not found.');
+
+  const excerpts: Array<{ fileId: string; filename: string; noteText?: string | null; text: string }> = [];
+  for (const f of docs.slice(0, 8)) {
     const text = await extractTextByMime(Buffer.from(f.content), f.mimeType, f.filename);
-    excerpts.push({ fileId: f.id, filename: f.filename, text: text.slice(0, 12000) });
+    excerpts.push({ fileId: f.id, filename: f.filename, noteText: f.noteText, text: text.slice(0, 16000) });
   }
 
-  const schema = {
-    fields: {
-      creditore_denominazione: { value: 'string|null', confidence: '0..1', sourceRef: 'string' },
-      debitore_denominazione_nome: { value: 'string|null', confidence: '0..1', sourceRef: 'string' },
-      tribunale: { value: 'string|null', confidence: '0..1', sourceRef: 'string' },
-      di_numero: { value: 'string|null', confidence: '0..1', sourceRef: 'string' },
-      rg_numero: { value: 'string|null', confidence: '0..1', sourceRef: 'string' },
-      di_data_notifica: { value: 'YYYY-MM-DD|null', confidence: '0..1', sourceRef: 'string' },
-      di_data_esecutorieta: { value: 'YYYY-MM-DD|null', confidence: '0..1', sourceRef: 'string' },
-      capitale_ingiunto: { value: 'number|null', confidence: '0..1', sourceRef: 'string' },
-      avvocato_nome: { value: 'string|null', confidence: '0..1', sourceRef: 'string' },
-      avvocato_pec: { value: 'string|null', confidence: '0..1', sourceRef: 'string' }
-    }
-  };
-
-  const prompt = `Sei un estrattore legale per precetto su decreto ingiuntivo.
-- Estrai SOLO i campi richiesti nello schema.
-- Non inventare valori.
-- Se dubbio, lascia value=null e confidence bassa.
-- Rispondi JSON puro conforme allo schema.`;
+  const instructions = await extractTemplateInstructions(tpl.content);
+  const promptPack = buildPromptFlows(instructions);
 
   return {
     ok: true,
     data: {
       practiceId: id,
+      templateId,
       mode: 'openclaw-client-only',
-      prompt,
-      schema,
-      documents: excerpts
+      workingMode: practice.workingMode,
+      documentSetId: targetDocumentSetId || null,
+      instructions,
+      promptFlows: promptPack.flows,
+      promptFlowCounts: promptPack.counts,
+      documents: excerpts,
+      outputContract: {
+        values: {
+          extract: 'object<string,{value,confidence,sourceRef}>',
+          derive: 'object<string,{value,confidence,sourceRef}>',
+          generate: 'object<string,{value,confidence,sourceRef}>'
+        }
+      }
+    }
+  };
+});
+
+
+
+app.post('/practices/:id/extract-openclaw-merge-flows', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const body = (request.body ?? {}) as {
+    actor?: string;
+    model?: string;
+    flowResults?: {
+      extract?: Record<string, { value: unknown; confidence?: number; sourceRef?: string }>;
+      derive?: Record<string, { value: unknown; confidence?: number; sourceRef?: string }>;
+      generate?: Record<string, { value: unknown; confidence?: number; sourceRef?: string }>;
+    };
+  };
+
+  // canonical internal merge: 3 isolated flows -> single ai_dataset_v1 buckets
+  const values = {
+    extract: body.flowResults?.extract ?? {},
+    derive: body.flowResults?.derive ?? {},
+    generate: body.flowResults?.generate ?? {}
+  };
+
+  const injected = await app.inject({
+    method: 'POST',
+    url: `/practices/${id}/extract-openclaw`,
+    payload: {
+      actor: body.actor ?? 'openclaw-client',
+      model: body.model ?? 'openclaw-default',
+      values
+    }
+  });
+
+  const json = injected.json();
+  return reply.code(injected.statusCode).send({
+    ok: injected.statusCode < 400,
+    data: {
+      mergedBuckets: {
+        extract: Object.keys(values.extract).length,
+        derive: Object.keys(values.derive).length,
+        generate: Object.keys(values.generate).length
+      },
+      applyResult: json.data ?? null,
+      error: json.error ?? null
+    }
+  });
+});
+
+app.post('/practices/:id/pipeline/run-openclaw', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const body = (request.body ?? {}) as {
+    actor?: string;
+    model?: string;
+    templateId?: string;
+    documentSetId?: string;
+    flowOverrides?: {
+      extract?: Record<string, { value: unknown; confidence?: number; sourceRef?: string }>;
+      derive?: Record<string, { value: unknown; confidence?: number; sourceRef?: string }>;
+      generate?: Record<string, { value: unknown; confidence?: number; sourceRef?: string }>;
+    };
+  };
+
+  const actor = body.actor ?? 'openclaw-runner';
+  const runId = crypto.randomUUID();
+
+  const payloadRes = await app.inject({
+    method: 'GET',
+    url: `/practices/${id}/extract-openclaw-payload${new URLSearchParams(Object.fromEntries(Object.entries({ templateId: body.templateId, documentSetId: body.documentSetId }).filter(([,v]) => !!v) as any)).toString() ? `?${new URLSearchParams(Object.fromEntries(Object.entries({ templateId: body.templateId, documentSetId: body.documentSetId }).filter(([,v]) => !!v) as any)).toString()}` : ''}`
+  });
+  const payloadJson = payloadRes.json();
+  if (payloadRes.statusCode >= 400) {
+    return reply.code(payloadRes.statusCode).send(payloadJson);
+  }
+
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      actor,
+      action: 'PIPELINE_RUN_START',
+      payloadJson: JSON.stringify({ runId, model: body.model ?? 'openclaw-default' })
+    }
+  });
+
+  if (!(payloadJson.data?.promptFlows?.length)) {
+    const blockedState = {
+      runId,
+      practiceId: id,
+      status: 'blocked',
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      durationMs: 0,
+      mode: 'strict-openclaw',
+      flows: {
+        extract: { kind: 'extract', status: 'skipped', outputCount: 0 },
+        derive: { kind: 'derive', status: 'skipped', outputCount: 0 },
+        generate: { kind: 'generate', status: 'skipped', outputCount: 0 }
+      }
+    };
+
+    await prisma.auditEvent.create({
+      data: {
+        id: crypto.randomUUID(),
+        practiceId: id,
+        actor,
+        action: 'PIPELINE_RUN_BLOCKED',
+        payloadJson: JSON.stringify({
+          runId,
+          state: blockedState,
+          documentSetId: body.documentSetId ?? null,
+          reason: 'No EXTRACT/DERIVE/GENERATE instructions found in selected template'
+        })
+      }
+    });
+
+    return reply.code(409).send({
+      ok: false,
+      error: 'Pipeline strict/OpenClaw unavailable: selected template has no EXTRACT/DERIVE/GENERATE instructions',
+      data: { runId, state: blockedState, flowResults: { extract: {}, derive: {}, generate: {} } }
+    });
+  }
+
+  const runner = await runOpenClawPipeline({
+    runId,
+    practiceId: id,
+    promptFlows: payloadJson.data.promptFlows ?? [],
+    documents: payloadJson.data.documents ?? [],
+    flowOverrides: body.flowOverrides,
+    retries: 2,
+    perFlowTimeoutMs: 30000,
+    onFlowStart: async (kind) => {
+      await prisma.auditEvent.create({
+        data: {
+          id: crypto.randomUUID(),
+          practiceId: id,
+          actor,
+          action: 'FLOW_RUN_START',
+          payloadJson: JSON.stringify({ runId, flow: kind })
+        }
+      });
+    },
+    onFlowOk: async (kind, outputCount, durationMs) => {
+      await prisma.auditEvent.create({
+        data: {
+          id: crypto.randomUUID(),
+          practiceId: id,
+          actor,
+          action: 'FLOW_RUN_OK',
+          payloadJson: JSON.stringify({ runId, flow: kind, outputCount, durationMs })
+        }
+      });
+    },
+    onFlowFail: async (kind, error, durationMs) => {
+      await prisma.auditEvent.create({
+        data: {
+          id: crypto.randomUUID(),
+          practiceId: id,
+          actor,
+          action: 'FLOW_RUN_FAIL',
+          payloadJson: JSON.stringify({ runId, flow: kind, durationMs, error })
+        }
+      });
+    }
+  });
+
+  if (runner.state.status === 'blocked') {
+    await prisma.auditEvent.create({
+      data: {
+        id: crypto.randomUUID(),
+        practiceId: id,
+        actor,
+        action: 'PIPELINE_RUN_BLOCKED',
+        payloadJson: JSON.stringify({ runId, state: runner.state, documentSetId: body.documentSetId ?? null })
+      }
+    });
+
+    return reply.code(409).send({
+      ok: false,
+      error: 'Pipeline requires explicit OpenClaw flow outputs',
+      data: { runId, state: runner.state, flowResults: runner.flowResults }
+    });
+  }
+
+  if (runner.state.status === 'failed') {
+    await prisma.auditEvent.create({
+      data: {
+        id: crypto.randomUUID(),
+        practiceId: id,
+        actor,
+        action: 'PIPELINE_RUN_FAILED',
+        payloadJson: JSON.stringify({ runId, state: runner.state })
+      }
+    });
+
+    return reply.code(500).send({
+      ok: false,
+      error: 'Pipeline run failed on one or more flows',
+      data: {
+        runId,
+        state: runner.state,
+        flowResults: runner.flowResults
+      }
+    });
+  }
+
+  const applyRes = await app.inject({
+    method: 'POST',
+    url: `/practices/${id}/extract-openclaw-merge-flows`,
+    payload: {
+      actor,
+      model: body.model ?? 'openclaw-default',
+      flowResults: runner.flowResults
+    }
+  });
+  const applyJson = applyRes.json();
+  if (applyRes.statusCode >= 400) {
+    return reply.code(applyRes.statusCode).send(applyJson);
+  }
+
+  let targetRowIndex = 1;
+  if (body.documentSetId) {
+    const existingSetRow = await prisma.tableRow.findFirst({ where: { practiceId: id, sourceSetId: body.documentSetId } });
+    if (existingSetRow) targetRowIndex = existingSetRow.rowIndex;
+    else {
+      const last = await prisma.tableRow.findFirst({ where: { practiceId: id }, orderBy: { rowIndex: 'desc' } });
+      targetRowIndex = (last?.rowIndex ?? 0) + 1;
+    }
+  }
+
+  const qualityScore = Math.max(0, Math.min(100, 100 - Object.values(runner.mergedRow).filter((v) => emptyValue(v)).length * 5));
+
+  await prisma.tableRow.upsert({
+    where: { practiceId_rowIndex: { practiceId: id, rowIndex: targetRowIndex } },
+    create: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      rowIndex: targetRowIndex,
+      source: 'pipeline-openclaw',
+      originMode: body.documentSetId ? WorkingMode.STANDARD_DOCUMENT_SET : WorkingMode.DETERMINISTIC_TABLE_FIRST,
+      sourceSetId: body.documentSetId ?? null,
+      valuesJson: JSON.stringify(runner.mergedRow),
+      status: RowStatus.NEEDS_REVIEW,
+      reviewState: ReviewState.TODO,
+      qualityScore
+    },
+    update: {
+      source: 'pipeline-openclaw',
+      originMode: body.documentSetId ? WorkingMode.STANDARD_DOCUMENT_SET : WorkingMode.DETERMINISTIC_TABLE_FIRST,
+      sourceSetId: body.documentSetId ?? null,
+      valuesJson: JSON.stringify(runner.mergedRow),
+      status: RowStatus.NEEDS_REVIEW,
+      reviewState: ReviewState.TODO,
+      qualityScore,
+      updatedAt: new Date()
+    }
+  });
+
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      actor,
+      action: 'PIPELINE_RUN_COMPLETED',
+      payloadJson: JSON.stringify({
+        runId,
+        durationMs: runner.state.durationMs,
+        flowCounts: {
+          extract: Object.keys(runner.flowResults.extract ?? {}).length,
+          derive: Object.keys(runner.flowResults.derive ?? {}).length,
+          generate: Object.keys(runner.flowResults.generate ?? {}).length
+        },
+        mergedFieldCount: Object.keys(runner.mergedRow).length
+      })
+    }
+  });
+
+  return {
+    ok: true,
+    data: {
+      runId,
+      state: runner.state,
+      flowResults: runner.flowResults,
+      mergedRowFieldCount: Object.keys(runner.mergedRow).length,
+      applyResult: applyJson.data ?? null,
+      activeRowIndex: targetRowIndex
     }
   };
 });
@@ -517,13 +1011,17 @@ app.post('/practices/:id/extract-openclaw', async (request, reply) => {
   const body = (request.body ?? {}) as {
     actor?: string;
     model?: string;
-    fields?: Record<string, { value: unknown; confidence?: number; sourceRef?: string }>;
+    values?: {
+      extract?: Record<string, { value: unknown; confidence?: number; sourceRef?: string }>;
+      derive?: Record<string, { value: unknown; confidence?: number; sourceRef?: string }>;
+      generate?: Record<string, { value: unknown; confidence?: number; sourceRef?: string }>;
+    };
   };
 
   const practice = await prisma.practice.findUnique({ where: { id }, include: { fieldValues: true } });
   if (!practice) return reply.notFound('Practice not found');
 
-  const fields = body.fields ?? {};
+  const fields = { ...(body.values?.extract ?? {}), ...(body.values?.derive ?? {}), ...(body.values?.generate ?? {}) };
   const existing = new Map(practice.fieldValues.map((f) => [f.fieldKey, f]));
 
   const upserts = Object.entries(fields).map(([fieldKey, payload]) => {
@@ -572,7 +1070,13 @@ app.post('/practices/:id/extract-openclaw', async (request, reply) => {
       payloadJson: JSON.stringify({
         model: body.model ?? 'openclaw-default',
         appliedFields: Object.keys(fields),
-        extractionMode: 'openclaw-client-only'
+        buckets: {
+          extract: Object.keys(body.values?.extract ?? {}).length,
+          derive: Object.keys(body.values?.derive ?? {}).length,
+          generate: Object.keys(body.values?.generate ?? {}).length
+        },
+        extractionMode: 'openclaw-client-only',
+        strictRunner: true
       })
     }
   });
@@ -582,202 +1086,10 @@ app.post('/practices/:id/extract-openclaw', async (request, reply) => {
     data: {
       applied: Object.keys(fields).length,
       mode: 'openclaw-client-only',
+      workingMode: practice.workingMode,
       model: body.model ?? 'openclaw-default'
     }
   };
-});
-
-app.post('/practices/:id/extract', async (request, reply) => {
-  const { id } = request.params as { id: string };
-  const body = (request.body ?? {}) as { actor?: string };
-
-  const files = await prisma.storedFile.findMany({
-    where: { practiceId: id, kind: FileKind.PRACTICE_DOCUMENT }
-  });
-
-  if (!files.length) return reply.badRequest('No practice documents uploaded');
-
-  const merged: Record<string, { value: unknown; confidence: number; sourceRef: string }> = {};
-  for (const f of files) {
-    const text = await extractTextByMime(Buffer.from(f.content), f.mimeType, f.filename);
-
-    const partial = extractPrecettoFieldsDetailed(text);
-    for (const [k, v] of Object.entries(partial)) {
-      if (!(k in merged) || v.confidence > merged[k].confidence) merged[k] = v;
-    }
-  }
-
-  const manualExec = await prisma.fieldValue.findUnique({
-    where: { practiceId_fieldKey: { practiceId: id, fieldKey: 'flag_esecutorieta_nel_titolo' } }
-  });
-
-  const autoExec = String(merged.esecutorieta_rilevata_auto?.value ?? 'INCERTA').toUpperCase();
-  let conflictExec = false;
-  if (manualExec) {
-    const man = String(JSON.parse(manualExec.valueJson) ?? 'NON_SO').toUpperCase();
-    if ((man === 'SI' && autoExec === 'NO') || (man === 'NO' && autoExec === 'SI')) {
-      conflictExec = true;
-    }
-  }
-  merged.conflitto_esecutorieta = { value: conflictExec, confidence: 1, sourceRef: 'computed: manual-vs-auto' };
-
-  const upserts = Object.entries(merged).map(([fieldKey, value]) =>
-    prisma.fieldValue.upsert({
-      where: { practiceId_fieldKey: { practiceId: id, fieldKey } },
-      create: {
-        id: crypto.randomUUID(),
-        practiceId: id,
-        fieldKey,
-        valueJson: JSON.stringify(value.value),
-        sourceType: 'document',
-        sourceRef: value.sourceRef,
-        confidence: value.confidence,
-        status: fieldKey === 'conflitto_esecutorieta' ? FieldStatus.AUTO_OK : FieldStatus.NEEDS_REVIEW,
-        lastModifiedBy: body.actor ?? 'extractor'
-      },
-      update: {
-        valueJson: JSON.stringify(value.value),
-        sourceType: 'document',
-        sourceRef: value.sourceRef,
-        confidence: value.confidence,
-        status: fieldKey === 'conflitto_esecutorieta' ? FieldStatus.AUTO_OK : FieldStatus.NEEDS_REVIEW,
-        lastModifiedBy: body.actor ?? 'extractor',
-        lastModifiedAt: new Date()
-      }
-    })
-  );
-
-  await prisma.$transaction(upserts);
-
-  await prisma.auditEvent.create({
-    data: {
-      id: crypto.randomUUID(),
-      practiceId: id,
-      actor: body.actor ?? 'extractor',
-      action: 'EXTRACTION_RUN',
-      payloadJson: JSON.stringify({ extractedFields: Object.keys(merged), conflictExec, extractionMode: 'openclaw-client-only' })
-    }
-  });
-
-  return { ok: true, data: { extracted: Object.fromEntries(Object.entries(merged).map(([k,v])=>[k,v.value])) } };
-});
-
-
-app.post('/practices/:id/recompute-interest', async (request, reply) => {
-  const { id } = request.params as { id: string };
-  const body = (request.body ?? {}) as { actor?: string };
-
-  const practice = await prisma.practice.findUnique({ where: { id }, include: { fieldValues: true } });
-  if (!practice) return reply.notFound('Practice not found');
-
-  const map = toFieldMap(practice.fieldValues);
-  const mode = String(map.interessi_modalita ?? 'none');
-
-  let interessiImporto = 0;
-  let warning: string | null = null;
-
-  if (mode === 'simple') {
-    const base = Number(map.interessi_base_calcolo ?? map.capitale_ingiunto ?? 0);
-    const tasso = Number(map.interessi_tasso_percent ?? 0);
-    const dal = String(map.interessi_dies_a_quo ?? '');
-    const al = String(map.interessi_data_finale ?? '');
-
-    if (!base || !tasso || !dal || !al) {
-      warning = 'Interessi simple: input incompleti, importo impostato a 0';
-    } else {
-      const d1 = new Date(dal);
-      const d2 = new Date(al);
-      const ms = d2.getTime() - d1.getTime();
-      const giorni = Math.max(0, Math.floor(ms / (1000 * 60 * 60 * 24)));
-      interessiImporto = Math.round((base * (tasso / 100) * (giorni / 365)) * 100) / 100;
-
-      await prisma.fieldValue.upsert({
-        where: { practiceId_fieldKey: { practiceId: id, fieldKey: 'interessi_giorni' } },
-        create: {
-          id: crypto.randomUUID(),
-          practiceId: id,
-          fieldKey: 'interessi_giorni',
-          valueJson: JSON.stringify(giorni),
-          sourceType: 'derived',
-          sourceRef: 'recompute-interest',
-          confidence: 1,
-          status: FieldStatus.AUTO_OK,
-          lastModifiedBy: body.actor ?? 'system'
-        },
-        update: {
-          valueJson: JSON.stringify(giorni),
-          sourceType: 'derived',
-          sourceRef: 'recompute-interest',
-          confidence: 1,
-          status: FieldStatus.AUTO_OK,
-          lastModifiedBy: body.actor ?? 'system',
-          lastModifiedAt: new Date()
-        }
-      });
-    }
-  }
-
-  await prisma.fieldValue.upsert({
-    where: { practiceId_fieldKey: { practiceId: id, fieldKey: 'interessi_importo' } },
-    create: {
-      id: crypto.randomUUID(),
-      practiceId: id,
-      fieldKey: 'interessi_importo',
-      valueJson: JSON.stringify(interessiImporto),
-      sourceType: 'derived',
-      sourceRef: 'recompute-interest',
-      confidence: 1,
-      status: FieldStatus.AUTO_OK,
-      lastModifiedBy: body.actor ?? 'system'
-    },
-    update: {
-      valueJson: JSON.stringify(interessiImporto),
-      sourceType: 'derived',
-      sourceRef: 'recompute-interest',
-      confidence: 1,
-      status: FieldStatus.AUTO_OK,
-      lastModifiedBy: body.actor ?? 'system',
-      lastModifiedAt: new Date()
-    }
-  });
-
-  if (mode === 'none') {
-    await prisma.fieldValue.upsert({
-      where: { practiceId_fieldKey: { practiceId: id, fieldKey: 'interessi_clausola_testo' } },
-      create: {
-        id: crypto.randomUUID(),
-        practiceId: id,
-        fieldKey: 'interessi_clausola_testo',
-        valueJson: JSON.stringify('oltre interessi come da titolo dal dovuto al saldo'),
-        sourceType: 'derived',
-        sourceRef: 'recompute-interest',
-        confidence: 1,
-        status: FieldStatus.AUTO_OK,
-        lastModifiedBy: body.actor ?? 'system'
-      },
-      update: {
-        valueJson: JSON.stringify('oltre interessi come da titolo dal dovuto al saldo'),
-        sourceType: 'derived',
-        sourceRef: 'recompute-interest',
-        confidence: 1,
-        status: FieldStatus.AUTO_OK,
-        lastModifiedBy: body.actor ?? 'system',
-        lastModifiedAt: new Date()
-      }
-    });
-  }
-
-  await prisma.auditEvent.create({
-    data: {
-      id: crypto.randomUUID(),
-      practiceId: id,
-      actor: body.actor ?? 'system',
-      action: 'RECOMPUTE_INTEREST',
-      payloadJson: JSON.stringify({ mode, interessiImporto, warning })
-    }
-  });
-
-  return { ok: true, data: { mode, interessiImporto, warning } };
 });
 
 app.post('/practices/:id/generate', async (request, reply) => {
@@ -907,6 +1219,316 @@ app.get('/practices/:id/template-report', async (request, reply) => {
   };
 });
 
+app.get('/practices/:id/table-rows', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const rows = await prisma.tableRow.findMany({ where: { practiceId: id }, orderBy: { rowIndex: 'asc' } });
+  return {
+    ok: true,
+    data: rows.map((r) => ({ ...r, values: JSON.parse(r.valuesJson) }))
+  };
+});
+
+app.get('/practices/:id/table-rows/:rowIndex', async (request, reply) => {
+  const { id, rowIndex: rowIndexRaw } = request.params as { id: string; rowIndex: string };
+  const rowIndex = Number(rowIndexRaw);
+  if (!Number.isFinite(rowIndex) || rowIndex <= 0) return reply.badRequest('rowIndex must be a positive number');
+
+  const row = await prisma.tableRow.findUnique({ where: { practiceId_rowIndex: { practiceId: id, rowIndex } } });
+  if (!row) return reply.notFound('Table row not found');
+  return { ok: true, data: { ...row, values: JSON.parse(row.valuesJson) } };
+});
+
+app.post('/practices/:id/table-rows', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const body = (request.body ?? {}) as { rowIndex?: number; values?: Record<string, unknown>; actor?: string; source?: string; originMode?: string; sourceSetId?: string; reviewState?: string; status?: string; qualityScore?: number };
+
+  const rowIndex = Number(body.rowIndex ?? 1);
+  const values = normalizeImportRow(body.values ?? {});
+  const row = await prisma.tableRow.upsert({
+    where: { practiceId_rowIndex: { practiceId: id, rowIndex } },
+    create: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      rowIndex,
+      source: body.source ?? 'manual-table',
+      originMode: String(body.originMode ?? '').toUpperCase() === 'DETERMINISTIC_TABLE_FIRST' ? WorkingMode.DETERMINISTIC_TABLE_FIRST : WorkingMode.STANDARD_DOCUMENT_SET,
+      sourceSetId: body.sourceSetId ?? null,
+      valuesJson: JSON.stringify(values),
+      status: String(body.status ?? '').toUpperCase() === 'OUTPUT_GENERATED' ? RowStatus.OUTPUT_GENERATED : String(body.status ?? '').toUpperCase() === 'NEEDS_REVIEW' ? RowStatus.NEEDS_REVIEW : RowStatus.READY,
+      reviewState: String(body.reviewState ?? '').toUpperCase() === 'APPROVED' ? ReviewState.APPROVED : String(body.reviewState ?? '').toUpperCase() === 'IN_REVIEW' ? ReviewState.IN_REVIEW : ReviewState.TODO,
+      qualityScore: Number.isFinite(Number(body.qualityScore)) ? Number(body.qualityScore) : null
+    },
+    update: {
+      source: body.source ?? 'manual-table',
+      originMode: String(body.originMode ?? '').toUpperCase() === 'DETERMINISTIC_TABLE_FIRST' ? WorkingMode.DETERMINISTIC_TABLE_FIRST : WorkingMode.STANDARD_DOCUMENT_SET,
+      sourceSetId: body.sourceSetId ?? null,
+      valuesJson: JSON.stringify(values),
+      status: String(body.status ?? '').toUpperCase() === 'OUTPUT_GENERATED' ? RowStatus.OUTPUT_GENERATED : String(body.status ?? '').toUpperCase() === 'NEEDS_REVIEW' ? RowStatus.NEEDS_REVIEW : RowStatus.READY,
+      reviewState: String(body.reviewState ?? '').toUpperCase() === 'APPROVED' ? ReviewState.APPROVED : String(body.reviewState ?? '').toUpperCase() === 'IN_REVIEW' ? ReviewState.IN_REVIEW : ReviewState.TODO,
+      qualityScore: Number.isFinite(Number(body.qualityScore)) ? Number(body.qualityScore) : null,
+      updatedAt: new Date()
+    }
+  });
+
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      actor: body.actor ?? 'user',
+      action: 'TABLE_ROW_UPSERTED',
+      payloadJson: JSON.stringify({ rowIndex, fieldCount: Object.keys(values).length })
+    }
+  });
+
+  return { ok: true, data: { ...row, values } };
+});
+
+app.post('/practices/:id/workflow/prepare', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const body = (request.body ?? {}) as {
+    actor?: string;
+    mode?: string;
+    templateId?: string;
+    documentSetId?: string;
+    rowIndex?: number;
+    simpleFieldValues?: Record<string, unknown>;
+  };
+
+  const practice = await prisma.practice.findUnique({ where: { id }, include: { files: true } });
+  if (!practice) return reply.notFound('Practice not found');
+
+  const templateId = body.templateId ?? practice.selectedTemplateId;
+  if (!templateId) return reply.badRequest('Template assente o invalido');
+
+  const shape = await getTemplateWorkflowShape(templateId);
+  if (!shape) return reply.notFound('Template not found.');
+
+  const requestedMode = String(body.mode ?? practice.workingMode).toUpperCase();
+  const mode = requestedMode === 'DETERMINISTIC_TABLE_FIRST' ? WorkingMode.DETERMINISTIC_TABLE_FIRST : WorkingMode.STANDARD_DOCUMENT_SET;
+  const actor = body.actor ?? 'user';
+
+  if (mode === WorkingMode.STANDARD_DOCUMENT_SET) {
+    const docs = practice.files.filter((f) => f.kind === FileKind.PRACTICE_DOCUMENT && (!body.documentSetId || f.documentSetId === body.documentSetId));
+    if (!docs.length) return reply.badRequest('Input assente o invalido: nessun documento disponibile per costruire la tabella minima di lavorazione');
+
+    const rowIndex = Number(body.rowIndex ?? 1);
+    const baseRow = Object.fromEntries(shape.templateKeys.map((key) => [key, ''])) as Record<string, unknown>;
+    const firstTable = { ...baseRow, ...normalizeImportRow(body.simpleFieldValues ?? {}) };
+    const warningPack = buildTableWarnings(firstTable);
+
+    const row = await prisma.tableRow.upsert({
+      where: { practiceId_rowIndex: { practiceId: id, rowIndex } },
+      create: {
+        id: crypto.randomUUID(),
+        practiceId: id,
+        rowIndex,
+        source: 'workflow-first-table',
+        originMode: WorkingMode.STANDARD_DOCUMENT_SET,
+        sourceSetId: body.documentSetId ?? null,
+        valuesJson: JSON.stringify(firstTable),
+        status: RowStatus.NEEDS_REVIEW,
+        reviewState: ReviewState.TODO
+      },
+      update: {
+        source: 'workflow-first-table',
+        originMode: WorkingMode.STANDARD_DOCUMENT_SET,
+        sourceSetId: body.documentSetId ?? null,
+        valuesJson: JSON.stringify(firstTable),
+        status: RowStatus.NEEDS_REVIEW,
+        reviewState: ReviewState.TODO,
+        updatedAt: new Date()
+      }
+    });
+
+    await prisma.auditEvent.create({
+      data: {
+        id: crypto.randomUUID(),
+        practiceId: id,
+        actor,
+        action: 'WORKFLOW_FIRST_TABLE_PREPARED',
+        payloadJson: JSON.stringify({ mode, rowIndex, documentSetId: body.documentSetId ?? null, specialPlaceholders: shape.hasSpecialPlaceholders })
+      }
+    });
+
+    return {
+      ok: true,
+      data: {
+        phase: 'first-table',
+        mode,
+        row: { ...row, values: firstTable },
+        inputSummary: {
+          templateId,
+          documentCount: docs.length,
+          documentSetId: body.documentSetId ?? null
+        },
+        warnings: warningPack.warnings,
+        missingKeys: warningPack.missingKeys,
+        hasSpecialPlaceholders: shape.hasSpecialPlaceholders,
+        nextAction: shape.hasSpecialPlaceholders ? 'enrich-final-table' : 'generate-from-current-table'
+      }
+    };
+  }
+
+  const rows = await prisma.tableRow.findMany({ where: { practiceId: id }, orderBy: { rowIndex: 'asc' } });
+  if (!rows.length) return reply.badRequest('Input assente o invalido: nessuna tabella disponibile');
+
+  const firstRow = rows.find((row) => row.rowIndex === Number(body.rowIndex ?? 1)) ?? rows[0];
+  const values = JSON.parse(firstRow.valuesJson) as Record<string, unknown>;
+  const importedColumns = Object.keys(values);
+  const matched = importedColumns.filter((column) => shape.fieldKeys.includes(column));
+  const missing = shape.fieldKeys.filter((field) => !importedColumns.includes(field));
+  const extra = importedColumns.filter((column) => !shape.fieldKeys.includes(column));
+  const warningPack = buildTableWarnings(values);
+  const warnings = [
+    ...(missing.length ? [{ code: 'TEMPLATE_COLUMNS_MISSING', level: 'warning', message: `Colonne mancanti rispetto al template: ${missing.join(', ')}` }] : []),
+    ...(extra.length ? [{ code: 'EXTRA_COLUMNS_PRESENT', level: 'warning', message: `Colonne extra rilevate: ${extra.join(', ')}` }] : []),
+    ...warningPack.warnings
+  ];
+
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      actor,
+      action: 'WORKFLOW_FIRST_TABLE_PREPARED',
+      payloadJson: JSON.stringify({ mode, rowIndex: firstRow.rowIndex, match: missing.length ? 'non-match' : 'match', specialPlaceholders: shape.hasSpecialPlaceholders })
+    }
+  });
+
+  return {
+    ok: true,
+    data: {
+      phase: 'first-table',
+      mode,
+      row: { ...firstRow, values },
+      inputSummary: {
+        templateId,
+        rowCount: rows.length,
+        importedColumns
+      },
+      comparison: {
+        outcome: missing.length ? 'non-match' : 'match',
+        matched,
+        missing,
+        extra
+      },
+      warnings,
+      hasSpecialPlaceholders: shape.hasSpecialPlaceholders,
+      nextAction: shape.hasSpecialPlaceholders ? 'enrich-final-table' : 'generate-from-current-table'
+    }
+  };
+});
+
+app.post('/practices/:id/workflow/enrich', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const body = (request.body ?? {}) as {
+    actor?: string;
+    templateId?: string;
+    rowIndex?: number;
+    deriveValues?: Record<string, unknown>;
+    generateValues?: Record<string, unknown>;
+  };
+
+  const practice = await prisma.practice.findUnique({ where: { id } });
+  if (!practice) return reply.notFound('Practice not found');
+
+  const templateId = body.templateId ?? practice.selectedTemplateId;
+  if (!templateId) return reply.badRequest('Template assente o invalido');
+
+  const shape = await getTemplateWorkflowShape(templateId);
+  if (!shape) return reply.notFound('Template not found.');
+  if (!shape.hasSpecialPlaceholders) return reply.badRequest('Nessun placeholder speciale presente: la seconda tabella non è necessaria');
+
+  const rowIndex = Number(body.rowIndex ?? 1);
+  const row = await prisma.tableRow.findUnique({ where: { practiceId_rowIndex: { practiceId: id, rowIndex } } });
+  if (!row) return reply.notFound('Table row not found');
+
+  const currentValues = JSON.parse(row.valuesJson) as Record<string, unknown>;
+  const finalValues = {
+    ...currentValues,
+    ...normalizeImportRow(body.deriveValues ?? {}),
+    ...normalizeImportRow(body.generateValues ?? {})
+  };
+  const warningPack = buildTableWarnings(finalValues);
+
+  const updated = await prisma.tableRow.update({
+    where: { practiceId_rowIndex: { practiceId: id, rowIndex } },
+    data: {
+      source: 'workflow-final-table',
+      valuesJson: JSON.stringify(finalValues),
+      status: RowStatus.NEEDS_REVIEW,
+      reviewState: ReviewState.TODO,
+      updatedAt: new Date()
+    }
+  });
+
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      actor: body.actor ?? 'user',
+      action: 'WORKFLOW_FINAL_TABLE_ENRICHED',
+      payloadJson: JSON.stringify({ rowIndex, deriveCount: Object.keys(body.deriveValues ?? {}).length, generateCount: Object.keys(body.generateValues ?? {}).length })
+    }
+  });
+
+  return {
+    ok: true,
+    data: {
+      phase: 'final-table',
+      row: { ...updated, values: finalValues },
+      warnings: warningPack.warnings,
+      derivedKeys: Object.keys(body.deriveValues ?? {}),
+      generatedKeys: Object.keys(body.generateValues ?? {}),
+      nextAction: 'generate-from-current-table'
+    }
+  };
+});
+
+app.post('/practices/:id/generate-docx-from-row', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const body = (request.body ?? {}) as { rowIndex?: number; actor?: string; templateId?: string };
+
+  const practice = await prisma.practice.findUnique({ where: { id } });
+  if (!practice) return reply.notFound('Practice not found');
+
+  const rowIndex = Number(body.rowIndex ?? 1);
+  const row = await prisma.tableRow.findUnique({ where: { practiceId_rowIndex: { practiceId: id, rowIndex } } });
+  if (!row) return reply.notFound('Table row not found');
+
+  const templateId = body.templateId ?? practice.selectedTemplateId;
+  if (!templateId) return reply.badRequest('No template selected for practice.');
+  const tpl = await prisma.template.findUnique({ where: { id: templateId } });
+  if (!tpl) return reply.notFound('Template not found.');
+
+  const values = JSON.parse(row.valuesJson) as Record<string, unknown>;
+  const templateFields = await extractTemplateFields(tpl.content);
+  const missing = templateFields.filter((k) => emptyValue(values[k]));
+  const out = await renderDocxTemplate(tpl.content, values);
+
+  await prisma.tableRow.update({
+    where: { practiceId_rowIndex: { practiceId: id, rowIndex } },
+    data: { status: RowStatus.OUTPUT_GENERATED, reviewState: ReviewState.IN_REVIEW, qualityScore: Math.max(0, Math.min(100, 100 - missing.length * 10)) }
+  });
+
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId: id,
+      actor: body.actor ?? 'user',
+      action: 'GENERATE_DOCX_FROM_ROW',
+      payloadJson: JSON.stringify({ rowIndex, templateId, missingTemplateFields: missing })
+    }
+  });
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = `precetto_${id}_row${rowIndex}_${ts}.docx`;
+  reply.header('x-rca-missing-fields', String(missing.length));
+  reply.header('content-type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+  reply.header('content-disposition', `attachment; filename="${filename}"`);
+  return Buffer.from(out);
+});
+
 app.post('/practices/:id/generate-docx', async (request, reply) => {
   const { id } = request.params as { id: string };
   const body = (request.body ?? {}) as { fast?: boolean; actor?: string; templateId?: string };
@@ -943,6 +1565,27 @@ app.post('/practices/:id/generate-docx', async (request, reply) => {
   return Buffer.from(out);
 });
 
+app.get('/practices/:id/table-rows/export.csv', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const rows = await prisma.tableRow.findMany({ where: { practiceId: id }, orderBy: { rowIndex: 'asc' } });
+  if (!rows.length) return reply.badRequest('No table rows available');
+
+  const parsed = rows.map((r) => ({ rowIndex: r.rowIndex, values: JSON.parse(r.valuesJson) as Record<string, unknown> }));
+  const allHeaders = Array.from(new Set(parsed.flatMap((r) => Object.keys(r.values)))).sort();
+  const headers = ['row_id', ...allHeaders];
+  const esc = (x: string) => `"${x.replaceAll('"', '""')}"`;
+  const lines = [headers.map(esc).join(',')];
+  for (const row of parsed) {
+    const values = [String(row.rowIndex), ...allHeaders.map((h) => String(row.values[h] ?? ''))];
+    lines.push(values.map(esc).join(','));
+  }
+
+  const csv = `${lines.join('\n')}\n`;
+  reply.header('content-type', 'text/csv; charset=utf-8');
+  reply.header('content-disposition', `attachment; filename="table_rows_${id}.csv"`);
+  return csv;
+});
+
 app.get('/practices/:id/export/merge-data.csv', async (request, reply) => {
   const { id } = request.params as { id: string };
   const practice = await prisma.practice.findUnique({ where: { id }, include: { fieldValues: true } });
@@ -957,6 +1600,222 @@ app.get('/practices/:id/export/merge-data.csv', async (request, reply) => {
   reply.header('content-type', 'text/csv; charset=utf-8');
   reply.header('content-disposition', `attachment; filename="merge_${id}.csv"`);
   return csv;
+});
+
+app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
+  const parts = request.parts();
+  const attachments: Array<{ filename: string; mimeType: string; bytes: Uint8Array }> = [];
+  let actor = 'discord-v1';
+
+  for await (const part of parts) {
+    if (part.type === 'field') {
+      if (part.fieldname === 'actor' && String(part.value ?? '').trim()) actor = String(part.value).trim();
+      continue;
+    }
+    attachments.push({
+      filename: part.filename,
+      mimeType: part.mimetype,
+      bytes: new Uint8Array(await part.toBuffer())
+    });
+  }
+
+  const { templates, tables } = classifyDiscordV1Attachments(attachments);
+  if (templates.length !== 1) return reply.badRequest('Discord v1 richiede esattamente 1 file template .docx');
+  if (tables.length !== 1) return reply.badRequest('Discord v1 richiede esattamente 1 tabella .xlsx o .csv');
+
+  const template = templates[0];
+  const table = tables[0];
+
+  const createPracticeRes = await app.inject({
+    method: 'POST',
+    url: '/practices',
+    payload: { actor, caseType: 'precetto_di', schemaVer: '1.0.0' }
+  });
+  const createPracticeJson = createPracticeRes.json();
+  if (createPracticeRes.statusCode >= 400) return reply.code(createPracticeRes.statusCode).send(createPracticeJson);
+  const practiceId = createPracticeJson.data.id as string;
+
+  await app.inject({
+    method: 'POST',
+    url: `/practices/${practiceId}/mode`,
+    payload: { actor, mode: 'DETERMINISTIC_TABLE_FIRST' }
+  });
+
+  const latestTemplate = await prisma.template.findFirst({ where: { name: 'discord-v1-template' }, orderBy: { version: 'desc' } });
+  const createdTemplate = await prisma.template.create({
+    data: {
+      id: crypto.randomUUID(),
+      name: 'discord-v1-template',
+      version: (latestTemplate?.version ?? 0) + 1,
+      filename: template.filename,
+      mimeType: template.mimeType,
+      sizeBytes: template.bytes.length,
+      sha256: sha256(Buffer.from(template.bytes)),
+      content: Buffer.from(template.bytes),
+      isActive: true
+    }
+  });
+  const templateId = createdTemplate.id;
+
+  const selectTemplateRes = await app.inject({
+    method: 'POST',
+    url: `/practices/${practiceId}/select-template`,
+    payload: { templateId, actor }
+  });
+  if (selectTemplateRes.statusCode >= 400) return reply.code(selectTemplateRes.statusCode).send(selectTemplateRes.json());
+
+  const importedRows = await parseImportFileRows(table.filename, table.mimeType, Buffer.from(table.bytes));
+  if (!importedRows.length) return reply.badRequest('Import file has no data rows.');
+
+  await prisma.tableRow.deleteMany({ where: { practiceId, source: 'import-batch' } });
+  for (let idx = 0; idx < importedRows.length; idx++) {
+    const sourceRow = importedRows[idx] as Record<string, unknown>;
+    const rowIdRaw = sourceRow.row_id;
+    const rowIndex = Number.isFinite(Number(rowIdRaw)) ? Number(rowIdRaw) : idx + 1;
+    const normalized = normalizeImportRow(sourceRow);
+
+    await prisma.tableRow.upsert({
+      where: { practiceId_rowIndex: { practiceId, rowIndex } },
+      create: {
+        id: crypto.randomUUID(),
+        practiceId,
+        rowIndex,
+        source: 'import-batch',
+        originMode: WorkingMode.DETERMINISTIC_TABLE_FIRST,
+        valuesJson: JSON.stringify(normalized),
+        status: RowStatus.READY,
+        reviewState: ReviewState.TODO
+      },
+      update: {
+        source: 'import-batch',
+        originMode: WorkingMode.DETERMINISTIC_TABLE_FIRST,
+        valuesJson: JSON.stringify(normalized),
+        status: RowStatus.READY,
+        reviewState: ReviewState.TODO,
+        updatedAt: new Date()
+      }
+    });
+  }
+
+  const activeEntriesCount = await upsertPracticeFieldsFromRow(practiceId, importedRows[0] as Record<string, unknown>, actor, table.filename);
+  await prisma.storedFile.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId,
+      kind: FileKind.PRACTICE_IMPORT,
+      filename: table.filename,
+      mimeType: table.mimeType,
+      sizeBytes: table.bytes.length,
+      sha256: sha256(Buffer.from(table.bytes)),
+      content: Buffer.from(table.bytes)
+    }
+  });
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId,
+      actor,
+      action: 'IMPORT_FILE_APPLIED',
+      payloadJson: JSON.stringify({ filename: table.filename, importedRows: importedRows.length, activeFields: activeEntriesCount, ingestChannel: 'discord-v1' })
+    }
+  });
+  const importJson = { ok: true, data: { filename: table.filename, importedRows: importedRows.length, activeFields: activeEntriesCount, activeRowIndex: 1 } };
+
+  const prepareRes = await app.inject({
+    method: 'POST',
+    url: `/practices/${practiceId}/workflow/prepare`,
+    payload: { actor, mode: 'DETERMINISTIC_TABLE_FIRST', templateId }
+  });
+  const prepareJson = prepareRes.json();
+  if (prepareRes.statusCode >= 400) return reply.code(prepareRes.statusCode).send(prepareJson);
+
+  let enrichData: any = null;
+  if (prepareJson.data?.hasSpecialPlaceholders) {
+    const enrichRes = await app.inject({
+      method: 'POST',
+      url: `/practices/${practiceId}/workflow/enrich`,
+      payload: { actor, templateId, rowIndex: 1, deriveValues: {}, generateValues: {} }
+    });
+    const enrichJson = enrichRes.json();
+    if (enrichRes.statusCode >= 400) return reply.code(enrichRes.statusCode).send(enrichJson);
+    enrichData = enrichJson.data ?? null;
+  }
+
+  const rowsRes = await app.inject({ method: 'GET', url: `/practices/${practiceId}/table-rows` });
+  const rowsJson = rowsRes.json();
+  if (rowsRes.statusCode >= 400) return reply.code(rowsRes.statusCode).send(rowsJson);
+  const rows = rowsJson.data ?? [];
+
+  const generatedDocs: Array<{ filename: string; bytes: Uint8Array }> = [];
+  const generationRows: Array<{ rowIndex: number; filename?: string; status: 'generated' | 'error'; missingFields: number; warnings: string[]; error?: string }> = [];
+
+  for (const row of rows) {
+    const rowIndex = Number(row.rowIndex ?? 0);
+    const genRes = await app.inject({
+      method: 'POST',
+      url: `/practices/${practiceId}/generate-docx-from-row`,
+      payload: { actor, rowIndex, templateId }
+    });
+
+    if (genRes.statusCode >= 400) {
+      generationRows.push({
+        rowIndex,
+        status: 'error',
+        missingFields: 0,
+        warnings: [],
+        error: genRes.json().error ?? `HTTP ${genRes.statusCode}`
+      });
+      continue;
+    }
+
+    const contentDisposition = String(genRes.headers['content-disposition'] ?? '');
+    const filename = contentDisposition.match(/filename="([^"]+)"/)?.[1] ?? `row_${rowIndex}.docx`;
+    const missingFields = Number(genRes.headers['x-rca-missing-fields'] ?? '0');
+    const bytes = new Uint8Array(genRes.rawPayload);
+    generatedDocs.push({ filename, bytes });
+    generationRows.push({
+      rowIndex,
+      filename,
+      status: 'generated',
+      missingFields: Number.isFinite(missingFields) ? missingFields : 0,
+      warnings: missingFields > 0 ? [`${missingFields} placeholder template lasciati vuoti o incompleti`] : []
+    });
+  }
+
+  const reportMarkdown = buildDiscordV1ReportMarkdown({
+    practiceId,
+    templateFilename: template.filename,
+    tableFilename: table.filename,
+    firstPhase: prepareJson.data,
+    secondPhase: enrichData,
+    generationRows
+  });
+  const summaryCsv = buildDiscordV1SummaryCsv(generationRows);
+  const zipBytes = await buildDiscordV1Zip({ generatedDocs, reportMarkdown, summaryCsv });
+  const finalSummary = buildDiscordV1FinalSummary(generationRows, Boolean(enrichData));
+
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId,
+      actor,
+      action: 'DISCORD_V1_AUTOCONTINUE_COMPLETED',
+      payloadJson: JSON.stringify({
+        templateFilename: template.filename,
+        tableFilename: table.filename,
+        importedRows: importJson.data?.importedRows ?? rows.length,
+        finalSummary
+      })
+    }
+  });
+
+  reply.header('content-type', 'application/zip');
+  reply.header('content-disposition', `attachment; filename="discord_v1_${practiceId}.zip"`);
+  reply.header('x-rca-discord-practice-id', practiceId);
+  reply.header('x-rca-discord-summary', JSON.stringify(finalSummary));
+  reply.header('x-rca-discord-initial-message', 'Lavorazione Discord v1 avviata: template + tabella ricevuti, auto-continue attivo.');
+  reply.header('x-rca-discord-final-message', `Esito Discord v1: ${finalSummary.generatedCount}/${finalSummary.totalRows} documenti generati, ${finalSummary.warningRows} righe con warning, ${finalSummary.errorRows} righe con errori.`);
+  return Buffer.from(zipBytes);
 });
 
 app.post('/templates', async (request, reply) => {
@@ -1026,6 +1885,25 @@ app.get('/templates/:id/mapping-preview', async (request, reply) => {
       mapped,
       unknown,
       mappingCoverage: templateFields.length ? Math.round((mapped.length / templateFields.length) * 100) : 100
+    }
+  };
+});
+
+app.get('/templates/:id/instructions', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const tpl = await prisma.template.findUnique({ where: { id } });
+  if (!tpl) return reply.notFound('Template not found');
+
+  const instructions = await extractTemplateInstructions(tpl.content);
+  const promptPack = buildPromptFlows(instructions);
+
+  return {
+    ok: true,
+    data: {
+      templateId: id,
+      instructions,
+      promptFlows: promptPack.flows,
+      promptFlowCounts: promptPack.counts
     }
   };
 });
@@ -1182,428 +2060,6 @@ app.get('/practices/:id/summary', async (request, reply) => {
 
 
 
-
-app.post('/discord/openclaw-event', async (request, reply) => {
-  const body = (request.body ?? {}) as {
-    channelId?: string;
-    user?: string;
-    text?: string;
-    practiceId?: string;
-    attachmentPaths?: string[];
-  };
-
-  if (!requireOperativeChannel(body.channelId)) {
-    return reply.code(403).send({ ok: false, error: 'Channel not authorized for operative flow' });
-  }
-
-  const attachments: Array<{ filename: string; mimeType: string; base64: string }> = [];
-  for (const fp of body.attachmentPaths ?? []) {
-    try {
-      const buf = await readFile(fp);
-      const filename = fp.split('/').pop() ?? 'attachment.bin';
-      const lower = filename.toLowerCase();
-      const mimeType = lower.endsWith('.pdf')
-        ? 'application/pdf'
-        : lower.endsWith('.docx')
-          ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-          : lower.endsWith('.json')
-            ? 'application/json'
-            : lower.endsWith('.csv')
-              ? 'text/csv'
-              : lower.endsWith('.xlsx')
-                ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                : 'application/octet-stream';
-      attachments.push({ filename, mimeType, base64: buf.toString('base64') });
-    } catch {
-      // skip unreadable file path
-    }
-  }
-
-  const injected = await app.inject({
-    method: 'POST',
-    url: '/discord/hook',
-    payload: {
-      channelId: body.channelId,
-      user: body.user,
-      text: body.text,
-      practiceId: body.practiceId,
-      attachments
-    }
-  });
-
-  return reply.code(injected.statusCode).send(injected.json());
-});
-
-app.post('/discord/hook', async (request, reply) => {
-  const body = (request.body ?? {}) as {
-    channelId?: string;
-    user?: string;
-    text?: string;
-    practiceId?: string;
-    attachments?: Array<{ filename: string; mimeType: string; base64: string }>;
-  };
-
-  if (!requireOperativeChannel(body.channelId)) {
-    return reply.code(403).send({ ok: false, error: 'Channel not authorized for operative flow' });
-  }
-
-  const user = body.user ?? 'discord-user';
-  let practiceId = body.practiceId;
-
-  // auto-create practice if attachments are present and no practiceId was provided
-  if (!practiceId && (body.attachments?.length ?? 0) > 0) {
-    const id = `P-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${nanoid()}`;
-    await prisma.practice.create({
-      data: {
-        id,
-        audits: {
-          create: {
-            id: crypto.randomUUID(),
-            actor: user,
-            action: 'DISCORD_HOOK_AUTO_NEW',
-            payloadJson: JSON.stringify({ channelId: body.channelId })
-          }
-        }
-      }
-    });
-    practiceId = id;
-  }
-
-  const attachedIds: string[] = [];
-  if (practiceId && body.attachments?.length) {
-    for (const a of body.attachments) {
-      const buf = Buffer.from(a.base64, 'base64');
-      const f = await prisma.storedFile.create({
-        data: {
-          id: crypto.randomUUID(),
-          practiceId,
-          kind: FileKind.PRACTICE_DOCUMENT,
-          filename: a.filename,
-          mimeType: a.mimeType,
-          sizeBytes: buf.length,
-          sha256: sha256(buf),
-          content: new Uint8Array(buf)
-        }
-      });
-      attachedIds.push(f.id);
-    }
-
-    await prisma.auditEvent.create({
-      data: {
-        id: crypto.randomUUID(),
-        practiceId,
-        actor: user,
-        action: 'DISCORD_HOOK_ATTACH',
-        payloadJson: JSON.stringify({ count: attachedIds.length })
-      }
-    });
-  }
-
-  if (body.text?.trim()) {
-    const parsed = parseDiscordPrecettoMessage(body.text);
-    if (parsed) {
-      const res = await app.inject({
-        method: 'POST',
-        url: '/discord/command',
-        payload: {
-          channelId: body.channelId,
-          user,
-          command: parsed.command,
-          practiceId: parsed.practiceId ?? practiceId,
-          args: parsed.args
-        }
-      });
-      const json = res.json();
-      return reply.code(res.statusCode).send({
-        ok: res.statusCode < 400,
-        data: {
-          practiceId,
-          attachedFileIds: attachedIds,
-          commandResult: json.data ?? null,
-          commandError: json.error ?? null
-        }
-      });
-    }
-  }
-
-  return {
-    ok: true,
-    data: {
-      practiceId,
-      attachedFileIds: attachedIds,
-      text: 'Hook processed'
-    }
-  };
-});
-
-app.post('/discord/router', async (request, reply) => {
-  const body = (request.body ?? {}) as {
-    channelId?: string;
-    user?: string;
-    text?: string;
-  };
-
-  if (!requireOperativeChannel(body.channelId)) {
-    return reply.code(403).send({ ok: false, error: 'Channel not authorized for operative flow' });
-  }
-
-  const parsed = parseDiscordPrecettoMessage(body.text ?? '');
-  if (!parsed) return reply.badRequest('Unsupported command syntax');
-
-  const payload = {
-    channelId: body.channelId,
-    user: body.user,
-    command: parsed.command,
-    practiceId: parsed.practiceId,
-    args: parsed.args
-  };
-
-  // Internal dispatch to same command handler logic
-  const res = await app.inject({
-    method: 'POST',
-    url: '/discord/command',
-    payload
-  });
-
-  const json = res.json();
-  if (res.statusCode >= 400) {
-    return reply.code(res.statusCode).send(json);
-  }
-
-  return {
-    ok: true,
-    data: {
-      parsed,
-      response: json.data
-    }
-  };
-});
-
-app.post('/discord/command', async (request, reply) => {
-  const body = (request.body ?? {}) as {
-    channelId?: string;
-    user?: string;
-    command?: string;
-    practiceId?: string;
-    args?: Record<string, unknown>;
-  };
-
-  if (!requireOperativeChannel(body.channelId)) {
-    return reply.code(403).send({ ok: false, error: 'Channel not authorized for operative flow' });
-  }
-
-  const user = body.user ?? 'discord-user';
-  const cmd = (body.command ?? '').trim();
-
-  if (cmd === 'new') {
-    const id = `P-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${nanoid()}`;
-    await prisma.practice.create({
-      data: {
-        id,
-        audits: {
-          create: {
-            id: crypto.randomUUID(),
-            actor: user,
-            action: 'DISCORD_NEW',
-            payloadJson: JSON.stringify({ channelId: body.channelId })
-          }
-        }
-      }
-    });
-    return { ok: true, data: { text: `Pratica creata: ${id}`, practiceId: id } };
-  }
-
-  if (!body.practiceId) return reply.badRequest('practiceId is required for this command');
-  const id = body.practiceId;
-
-  if (cmd === 'status') {
-    const practice = await prisma.practice.findUnique({ where: { id }, include: { fieldValues: true, files: true } });
-    if (!practice) return reply.notFound('Practice not found');
-    const missing = practice.fieldValues.filter((f) => f.status === 'MISSING').length;
-    return { ok: true, data: { text: `Status ${id}: files=${practice.files.length}, fields=${practice.fieldValues.length}, missing=${missing}` } };
-  }
-
-  if (cmd === 'extract') {
-    const files = await prisma.storedFile.findMany({ where: { practiceId: id, kind: FileKind.PRACTICE_DOCUMENT } });
-    if (!files.length) return reply.badRequest('No documents for extraction');
-
-    const merged: Record<string, { value: unknown; confidence: number; sourceRef: string }> = {};
-    for (const f of files) {
-      const text = await extractTextByMime(Buffer.from(f.content), f.mimeType, f.filename);
-      const partial = extractPrecettoFieldsDetailed(text);
-      for (const [k, v] of Object.entries(partial)) {
-        if (!(k in merged) || v.confidence > merged[k].confidence) merged[k] = v;
-      }
-    }
-
-    const upserts = Object.entries(merged).map(([fieldKey, value]) =>
-      prisma.fieldValue.upsert({
-        where: { practiceId_fieldKey: { practiceId: id, fieldKey } },
-        create: {
-          id: crypto.randomUUID(), practiceId: id, fieldKey,
-          valueJson: JSON.stringify(value.value),
-          sourceType: 'document', sourceRef: value.sourceRef, confidence: value.confidence,
-          status: FieldStatus.NEEDS_REVIEW, lastModifiedBy: user
-        },
-        update: {
-          valueJson: JSON.stringify(value.value),
-          sourceType: 'document', sourceRef: value.sourceRef, confidence: value.confidence,
-          status: FieldStatus.NEEDS_REVIEW, lastModifiedBy: user, lastModifiedAt: new Date()
-        }
-      })
-    );
-    await prisma.$transaction(upserts);
-    await prisma.auditEvent.create({ data: { id: crypto.randomUUID(), practiceId: id, actor: user, action: 'DISCORD_EXTRACT', payloadJson: JSON.stringify({ fields: Object.keys(merged) }) } });
-    return { ok: true, data: { text: `Estrazione completata (${Object.keys(merged).length} campi)` } };
-  }
-
-  if (cmd === 'set') {
-    const fieldKey = String(body.args?.fieldKey ?? '');
-    const value = body.args?.value;
-    if (!fieldKey) return reply.badRequest('args.fieldKey is required');
-    await prisma.fieldValue.upsert({
-      where: { practiceId_fieldKey: { practiceId: id, fieldKey } },
-      create: {
-        id: crypto.randomUUID(), practiceId: id, fieldKey,
-        valueJson: JSON.stringify(value), sourceType: 'manual', status: FieldStatus.MANUAL,
-        lastModifiedBy: user
-      },
-      update: {
-        valueJson: JSON.stringify(value), sourceType: 'manual', status: FieldStatus.MANUAL,
-        lastModifiedBy: user, lastModifiedAt: new Date()
-      }
-    });
-    await prisma.auditEvent.create({ data: { id: crypto.randomUUID(), practiceId: id, actor: user, action: 'DISCORD_SET', payloadJson: JSON.stringify({ fieldKey }) } });
-    return { ok: true, data: { text: `Campo aggiornato: ${fieldKey}` } };
-  }
-
-  if (cmd === 'attach') {
-    const filename = String(body.args?.filename ?? 'upload.bin');
-    const mimeType = String(body.args?.mimeType ?? 'application/octet-stream');
-    const b64 = String(body.args?.base64 ?? '');
-    if (!b64) return reply.badRequest('args.base64 is required for attach');
-
-    const buf = Buffer.from(b64, 'base64');
-    const frow = await prisma.storedFile.create({
-      data: {
-        id: crypto.randomUUID(),
-        practiceId: id,
-        kind: FileKind.PRACTICE_DOCUMENT,
-        filename,
-        mimeType,
-        sizeBytes: buf.length,
-        sha256: sha256(buf),
-        content: new Uint8Array(buf)
-      }
-    });
-
-    await prisma.auditEvent.create({
-      data: {
-        id: crypto.randomUUID(),
-        practiceId: id,
-        actor: user,
-        action: 'DISCORD_ATTACH',
-        payloadJson: JSON.stringify({ fileId: frow.id, filename })
-      }
-    });
-
-    return { ok: true, data: { text: `File allegato: ${filename}`, fileId: frow.id } };
-  }
-
-  if (cmd === 'interessi') {
-    const mode = String(body.args?.mode ?? 'none');
-    const allowed = new Set(['none', 'simple', 'complex']);
-    if (!allowed.has(mode)) return reply.badRequest('mode must be none|simple|complex');
-
-    await prisma.fieldValue.upsert({
-      where: { practiceId_fieldKey: { practiceId: id, fieldKey: 'interessi_modalita' } },
-      create: {
-        id: crypto.randomUUID(), practiceId: id, fieldKey: 'interessi_modalita',
-        valueJson: JSON.stringify(mode === 'complex' ? 'complex_placeholder' : mode),
-        sourceType: 'manual', status: FieldStatus.MANUAL, lastModifiedBy: user
-      },
-      update: {
-        valueJson: JSON.stringify(mode === 'complex' ? 'complex_placeholder' : mode),
-        sourceType: 'manual', status: FieldStatus.MANUAL, lastModifiedBy: user, lastModifiedAt: new Date()
-      }
-    });
-
-    const tipo = String(body.args?.tipo ?? 'legale');
-    if (mode === 'simple') {
-      await prisma.fieldValue.upsert({
-        where: { practiceId_fieldKey: { practiceId: id, fieldKey: 'interessi_tipo_tasso' } },
-        create: {
-          id: crypto.randomUUID(), practiceId: id, fieldKey: 'interessi_tipo_tasso',
-          valueJson: JSON.stringify(tipo), sourceType: 'manual', status: FieldStatus.MANUAL, lastModifiedBy: user
-        },
-        update: {
-          valueJson: JSON.stringify(tipo), sourceType: 'manual', status: FieldStatus.MANUAL, lastModifiedBy: user, lastModifiedAt: new Date()
-        }
-      });
-    }
-
-    await prisma.auditEvent.create({
-      data: { id: crypto.randomUUID(), practiceId: id, actor: user, action: 'DISCORD_INTERESSI', payloadJson: JSON.stringify({ mode, tipo }) }
-    });
-
-    return { ok: true, data: { text: `Interessi impostati: mode=${mode}${mode === 'simple' ? `, tipo=${tipo}` : ''}` } };
-  }
-
-  if (cmd === 'export') {
-    const format = String(body.args?.format ?? 'docx');
-    if (format === 'csv') {
-      const practice = await prisma.practice.findUnique({ where: { id }, include: { fieldValues: true } });
-      if (!practice) return reply.notFound('Practice not found');
-      const entries = practice.fieldValues.map((f) => [f.fieldKey, JSON.parse(f.valueJson)] as const);
-      const headers = entries.map(([k]) => k);
-      const values = entries.map(([,v]) => String(v ?? ''));
-      const esc = (x:string)=> `"${x.replaceAll('"','""')}"`;
-      const csv = `${headers.map(esc).join(',')}\n${values.map(esc).join(',')}\n`;
-      return { ok: true, data: { text: `CSV pronto (${headers.length} colonne)`, csv } };
-    }
-
-    return { ok: true, data: { text: 'Usa generate/generate-fast per ottenere DOCX' } };
-  }
-
-  if (cmd === 'generate' || cmd === 'generate-fast') {
-    const fast = cmd === 'generate-fast';
-    const practice = await prisma.practice.findUnique({ where: { id }, include: { fieldValues: true } });
-    if (!practice) return reply.notFound('Practice not found');
-
-    const templateId = String(body.args?.templateId ?? practice.selectedTemplateId ?? '');
-    if (!templateId) return reply.badRequest('templateId missing (set practice template or pass args.templateId)');
-
-    const tpl = await prisma.template.findUnique({ where: { id: templateId } });
-    if (!tpl) return reply.notFound('Template not found. The selected template may have been removed or disabled.');
-
-    const fields = Object.fromEntries(practice.fieldValues.map((f) => [f.fieldKey, JSON.parse(f.valueJson)]));
-    const templateFields = await extractTemplateFields(tpl.content);
-    const missing = templateFields.filter((k) => emptyValue(fields[k]));
-    const out = await renderDocxTemplate(tpl.content, fields);
-    const filename = `precetto_${id}_${new Date().toISOString().replace(/[:.]/g, '-')}.docx`;
-
-    const frow = await prisma.storedFile.create({
-      data: {
-        id: crypto.randomUUID(), practiceId: id, kind: FileKind.PRACTICE_DOCUMENT,
-        filename, mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        sizeBytes: out.byteLength, sha256: sha256(Buffer.from(out)), content: new Uint8Array(out)
-      }
-    });
-
-    await prisma.auditEvent.create({ data: { id: crypto.randomUUID(), practiceId: id, actor: user, action: fast ? 'DISCORD_GENERATE_FAST' : 'DISCORD_GENERATE', payloadJson: JSON.stringify({ templateId, outputFileId: frow.id }) } });
-
-    return {
-      ok: true,
-      data: {
-        text: `Documento generato (${fast ? 'fast' : 'standard'}): ${filename} (campi template mancanti: ${missing.length})`,
-        fileId: frow.id,
-        downloadPath: `/practices/${id}/files/${frow.id}/download`
-      }
-    };
-  }
-
-  return reply.badRequest('Unknown command');
-});
 
 const port = Number(process.env.PORT ?? 8787);
 app.listen({ port, host: '0.0.0.0' })

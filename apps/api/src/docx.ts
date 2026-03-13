@@ -26,40 +26,6 @@ function normalizeValue(value: unknown): string {
   return String(value);
 }
 
-function pick(map: Record<string, unknown>, ...keys: string[]) {
-  for (const k of keys) {
-    const v = map[k];
-    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
-  }
-  return '';
-}
-
-function buildSubjectIdentity(prefix: 'creditore' | 'debitore', map: Record<string, unknown>): string {
-  const name = pick(map, `${prefix}_denominazione_nome`, `${prefix}_denominazione`);
-  const cf = pick(map, `${prefix}_cf`);
-  const piva = pick(map, `${prefix}_piva`);
-  if (!name) return '';
-
-  if (cf && piva) {
-    if (cf === piva) return `${name} (C.F./P.IVA ${cf})`;
-    return `${name} (C.F. ${cf} - P.IVA ${piva})`;
-  }
-  if (cf) return `${name} (C.F. ${cf})`;
-  if (piva) return `${name} (P.IVA ${piva})`;
-  return name;
-}
-
-function enrichComputedFields(map: Record<string, unknown>): Record<string, unknown> {
-  return {
-    ...map,
-    debitore_identificativo_completo: buildSubjectIdentity('debitore', map),
-    creditore_identificativo_completo: buildSubjectIdentity('creditore', map),
-    // compatibilità con placeholder testuale attuale nel template fornito
-    'denominazione debitore + c.f e/o p.iva': buildSubjectIdentity('debitore', map),
-    'denominazione creditore + c.f e/o p.iva': buildSubjectIdentity('creditore', map)
-  };
-}
-
 function extractMergeFieldName(instr: string): string | null {
   const m = instr.match(/MERGEFIELD\s+"?([A-Za-z0-9_\.]+)"?/i);
   return m?.[1] ?? null;
@@ -153,9 +119,8 @@ export async function renderDocxTemplate(
 ): Promise<Uint8Array> {
   const zip = await JSZip.loadAsync(docxBytes);
 
-  const enriched = enrichComputedFields(fieldMap);
   const replacements = Object.fromEntries(
-    Object.entries(enriched).map(([k, v]) => [k, xmlEscape(normalizeValue(v))])
+    Object.entries(fieldMap).map(([k, v]) => [k, xmlEscape(normalizeValue(v))])
   );
 
   for (const fileName of XML_TARGETS) {
