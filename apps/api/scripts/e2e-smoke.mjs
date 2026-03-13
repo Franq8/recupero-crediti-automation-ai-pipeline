@@ -17,9 +17,9 @@ async function mkMinimalDocx() {
   zip.folder('word')?.file('document.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
-    <w:p><w:r><w:t>Tribunale: {{tribunale}}</w:t></w:r></w:p>
-    <w:p><w:r><w:t>DI: {{di_numero}}</w:t></w:r></w:p>
-    <w:p><w:r><w:t>Capitale: {{capitale_ingiunto}}</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Tribunale: {tribunale}</w:t></w:r></w:p>
+    <w:p><w:r><w:t>DI: [{di_numero} estrai il numero del decreto ingiuntivo]</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Capitale: [[{capitale_ingiunto} genera il valore finale del capitale ingiunto]]</w:t></w:r></w:p>
   </w:body>
 </w:document>`);
   return zip.generateAsync({ type: 'uint8array' });
@@ -47,13 +47,17 @@ async function postForm(path, form) {
   return data;
 }
 
+async function extractDocumentXml(docxBytes) {
+  const zip = await JSZip.loadAsync(docxBytes);
+  return zip.file('word/document.xml')?.async('string');
+}
+
 async function run() {
   const health = await fetch(`${API}/health`);
   if (!health.ok) throw new Error(`API health failed: ${health.status}`);
 
   const p = await postJson('/practices', { actor: 'smoke' });
   const practiceId = p.data.id;
-  console.log('practice:', practiceId);
 
   const docx = await mkMinimalDocx();
   const tplFd = new FormData();
@@ -62,10 +66,14 @@ async function run() {
   tplFd.append('file', new Blob([docx], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }), 'smoke-template.docx');
   const tpl = await postForm('/templates', tplFd);
   const templateId = tpl.data.id;
-  console.log('template:', templateId);
 
   await postJson(`/practices/${practiceId}/select-template`, { templateId, actor: 'smoke' });
-  await postJson(`/practices/${practiceId}/sync-template-fields`, { templateId, actor: 'smoke' });
+
+  const instructionsRes = await fetch(`${API}/templates/${templateId}/instructions`);
+  const instructionsJson = await instructionsRes.json();
+  if (!instructionsRes.ok) throw new Error('instructions endpoint failed');
+  const counts = instructionsJson.data?.promptFlowCounts ?? {};
+  if (counts.extract !== 1 || counts.derive !== 1 || counts.generate !== 1) throw new Error(`unexpected counts ${JSON.stringify(counts)}`);
 
   await postJson(`/practices/${practiceId}/fields`, { fieldKey: 'tribunale', value: 'Treviso', status: 'MANUAL', sourceType: 'manual', actor: 'smoke' });
   await postJson(`/practices/${practiceId}/fields`, { fieldKey: 'di_numero', value: '667/2024', status: 'MANUAL', sourceType: 'manual', actor: 'smoke' });
@@ -78,8 +86,11 @@ async function run() {
   });
   if (!gen.ok) throw new Error(`generate-docx failed: ${gen.status}`);
   const bytes = new Uint8Array(await gen.arrayBuffer());
-  if (bytes.byteLength < 300) throw new Error('Generated DOCX too small');
-  console.log('docx-bytes:', bytes.byteLength);
+  const xml = await extractDocumentXml(bytes);
+  if (!xml?.includes('Treviso')) throw new Error('missing tribunale replacement');
+  if (!xml?.includes('667/2024')) throw new Error('missing di_numero replacement');
+  if (!xml?.includes('14594.48')) throw new Error('missing capitale_ingiunto replacement');
+  if (xml.includes('{tribunale}') || xml.includes('[{di_numero}') || xml.includes('[[{capitale_ingiunto}')) throw new Error('canonical placeholders still present after render');
 
   console.log('SMOKE_OK');
 }

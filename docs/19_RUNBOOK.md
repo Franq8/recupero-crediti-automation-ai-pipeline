@@ -26,7 +26,7 @@ Workflow matrix aggiornato:
 - selezione iter principale (`Template + documentazione` oppure `Template + tabella`)
 - preparazione prima tabella (`POST /practices/:id/workflow/prepare`)
 - revisione/edit della tabella workspace (`POST /practices/:id/table-rows`)
-- solo se il template contiene `[[ ]]` / `[[[ ]]]`: arricchimento seconda tabella (`POST /practices/:id/workflow/enrich`)
+- solo se il template contiene `[{campo} istruzione]` o `[[{campo} istruzione]]`: arricchimento seconda tabella (`POST /practices/:id/workflow/enrich`)
 - generazione finale da riga workspace (`POST /practices/:id/generate-docx-from-row`)
 
 Manuale:
@@ -83,6 +83,22 @@ Smoke tabella deterministic-first:
 - il layer Discord legacy è stato rimosso dal backend applicativo.
 - Discord v1 usa un endpoint nuovo e minimo, ma riusa il motore standard del web.
 - l’app espone solo percorsi web/API coerenti con la policy OpenClaw-only.
+
+## doc-generator — canale batch nativo
+- canale Discord canonico batch-only: `1482018084020551883` (`doc-generator`)
+- routing corretto richiesto:
+  - **OpenClaw gateway** deve escludere `doc-generator` dal wildcard conversazionale del main agent
+  - il canale viene gestito dal listener batch nativo del progetto
+- listener locale progetto:
+  - script: `npm run -w @rca/api docgen:listen`
+  - token bot: letto da `~/.openclaw/openclaw.json` se `DISCORD_BOT_TOKEN` non è impostato
+  - API target di default: `http://127.0.0.1:8787/discord/v1/template-table-autocontinue`
+- comportamento atteso:
+  - accetta **solo** 1 `.docx` + 1 `.xlsx|.csv` nello stesso messaggio
+  - nessuna risposta conversazionale/intermedia
+  - risposta finale con ZIP + messaggio sintetico
+- test reale rapido con fixture già presenti:
+  - `npm run -w @rca/api docgen:send-fixtures`
 
 ## Backup minimo consigliato
 - backup volume DB (docker volume `rca_data`)

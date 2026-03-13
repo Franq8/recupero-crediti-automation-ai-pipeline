@@ -1,5 +1,10 @@
 import type { PlaceholderKind, TemplateInstruction } from './template-instructions.js';
 
+type FlowPromptItem = {
+  key: string;
+  prompt: string;
+};
+
 type FlowPromptPack = {
   kind: PlaceholderKind;
   instructions: string[];
@@ -8,9 +13,9 @@ type FlowPromptPack = {
   schema: Record<string, { value: 'string|number|null'; confidence: '0..1'; sourceRef: 'string' }>;
 };
 
-function buildSingle(kind: PlaceholderKind, instructions: string[]): FlowPromptPack {
+function buildSingle(kind: PlaceholderKind, items: FlowPromptItem[]): FlowPromptPack {
   const schema = Object.fromEntries(
-    instructions.map((k) => [k, { value: 'string|number|null', confidence: '0..1', sourceRef: 'string' }])
+    items.map((item) => [item.key, { value: 'string|number|null', confidence: '0..1', sourceRef: 'string' }])
   ) as FlowPromptPack['schema'];
 
   const common = [
@@ -42,10 +47,11 @@ function buildSingle(kind: PlaceholderKind, instructions: string[]): FlowPromptP
     ].join('\n')
   };
 
+  const instructionLines = items.map((item, i) => `${i + 1}. ${item.prompt}`).join('\n') || '(none)';
   const userPrompt = [
     `TIPO FLUSSO: ${kind.toUpperCase()}`,
-    `ISTRUZIONI DA RISOLVERE (${instructions.length}):`,
-    instructions.map((x, i) => `${i + 1}. ${x}`).join('\n') || '(none)',
+    `ISTRUZIONI DA RISOLVERE (${items.length}):`,
+    instructionLines,
     'TOOLS DISPONIBILI: interest.compute(base,tassoPercent,dal,al)',
     'Per calcoli matematici usa i tool.',
     'OUTPUT JSON shape:',
@@ -54,7 +60,7 @@ function buildSingle(kind: PlaceholderKind, instructions: string[]): FlowPromptP
 
   return {
     kind,
-    instructions,
+    instructions: items.map((item) => item.prompt),
     systemPrompt: `${systemByKind[kind]}\n\n${common}`,
     userPrompt,
     schema
@@ -62,9 +68,15 @@ function buildSingle(kind: PlaceholderKind, instructions: string[]): FlowPromptP
 }
 
 export function buildPromptFlows(instructions: TemplateInstruction[]) {
-  const extract = instructions.filter((i) => i.kind === 'extract').map((i) => i.key);
-  const derive = instructions.filter((i) => i.kind === 'derive').map((i) => i.key);
-  const generate = instructions.filter((i) => i.kind === 'generate').map((i) => i.key);
+  const extract = instructions
+    .filter((i) => i.kind === 'extract')
+    .map((i) => ({ key: i.key, prompt: i.key }));
+  const derive = instructions
+    .filter((i) => i.kind === 'derive')
+    .map((i) => ({ key: i.key, prompt: `${i.key}: ${i.instruction ?? ''}`.trim() }));
+  const generate = instructions
+    .filter((i) => i.kind === 'generate')
+    .map((i) => ({ key: i.key, prompt: `${i.key}: ${i.instruction ?? ''}`.trim() }));
 
   const flows: FlowPromptPack[] = [];
   if (extract.length) flows.push(buildSingle('extract', extract));

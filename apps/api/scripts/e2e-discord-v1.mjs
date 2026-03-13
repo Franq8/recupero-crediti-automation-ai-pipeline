@@ -19,6 +19,14 @@ async function mkDocx(lines) {
   return zip.generateAsync({ type: 'uint8array' });
 }
 
+async function readGeneratedDoc(zip, rowIndex) {
+  const fileName = Object.keys(zip.files).find((file) => file.startsWith('generated-docx/') && file.includes(`row${rowIndex}_`) && file.endsWith('.docx'));
+  if (!fileName) throw new Error(`missing generated doc for row ${rowIndex}`);
+  const bytes = await zip.file(fileName)?.async('uint8array');
+  const docZip = await JSZip.loadAsync(bytes);
+  return docZip.file('word/document.xml')?.async('string');
+}
+
 async function runCase(name, templateLines, csv, expectSecondPhase) {
   const form = new FormData();
   form.append('actor', `discord-test-${name}`);
@@ -44,19 +52,25 @@ async function runCase(name, templateLines, csv, expectSecondPhase) {
   if (generatedFiles.length !== 2) throw new Error(`${name}: expected 2 generated docx, got ${generatedFiles.length}`);
   if (expectSecondPhase && !report.includes('Executed: yes')) throw new Error(`${name}: enrich phase not reported`);
   if (!expectSecondPhase && !report.includes('Executed: no')) throw new Error(`${name}: enrich skip not reported`);
+
+  const row1Xml = await readGeneratedDoc(zip, 1);
+  const row2Xml = await readGeneratedDoc(zip, 2);
+  if (!row1Xml || !row2Xml) throw new Error(`${name}: missing generated document xml`);
+  if (row1Xml.includes('{') || row1Xml.includes('[{') || row1Xml.includes('[[{')) throw new Error(`${name}: canonical placeholders still present in row 1`);
+  if (row2Xml.includes('{') || row2Xml.includes('[{') || row2Xml.includes('[[{')) throw new Error(`${name}: canonical placeholders still present in row 2`);
 }
 
 async function run() {
   await runCase(
     'simple',
-    ['Tribunale: {{tribunale}}', 'DI: {{di_numero}}', 'Capitale: {{capitale_ingiunto}}'],
+    ['Tribunale: {tribunale}', 'DI: {di_numero}', 'Capitale: {capitale_ingiunto}'],
     ['row_id,tribunale,di_numero,capitale_ingiunto', '1,Treviso,100/2026,1000.00', '2,Padova,101/2026,2500.50'].join('\n'),
     false
   );
 
   await runCase(
     'special',
-    ['Tribunale: {{tribunale}}', 'DI: {{di_numero}}', 'Calc: {{totale_complessivo}}', '[[GENERATE: clausola_finale]]'],
+    ['Tribunale: {tribunale}', 'DI: [{di_numero} estrai il numero del decreto]', 'Calc: [[{totale_complessivo} genera il totale complessivo finale]]'],
     ['row_id,tribunale,di_numero,totale_complessivo', '1,Treviso,100/2026,1000.00', '2,Padova,101/2026,2500.50'].join('\n'),
     true
   );

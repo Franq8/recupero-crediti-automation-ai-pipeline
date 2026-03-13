@@ -1,5 +1,41 @@
 # 18 — Implementation Log
 
+## 2026-03-13 — ExecPlan 45 (migrazione grammatica placeholder canonica)
+### Correzione piano / allineamento reale
+- Il piano richiedeva di non lasciare disallineato parser vs renderer: per chiuderlo davvero è stato introdotto un layer condiviso `apps/api/src/placeholder-grammar.ts` usato sia in lettura sia in render.
+- La grammatica canonica fissata e resa effettiva nel codice è ora:
+  - extract → `{campo}`
+  - derive → `[{campo} istruzione]`
+  - generate → `[[{campo} istruzione]]`
+- Le chiavi finali di tabella/workspace restano sempre pulite (`campo`).
+
+### Allineamento parser / workflow / renderer
+- `template-instructions.ts` ora legge la grammatica canonica su tutti gli XML `word/*.xml` e restituisce `key`, `kind`, `instruction` allineati.
+- `docx.ts` ora:
+  - estrae chiavi anche dalla nuova sintassi canonica;
+  - continua a supportare temporaneamente anche `{{campo}}`, `«campo»`, `MERGEFIELD` per compatibilità;
+  - popola davvero i DOCX finali sostituendo `{campo}`, `[{campo} ...]`, `[[{campo} ...]]` con il valore finale della chiave pulita `campo`.
+- `prompt-pack.ts` ora conserva schema/output keyed by `campo`, ma passa ai flow derive/generate anche l’istruzione testuale reale del placeholder.
+- `template-table-structure.ts` e workflow backend restano coerenti perché consumano solo chiavi pulite estratte centralmente.
+
+### Fixture / smoke aggiornati
+- Aggiornati gli smoke script reali:
+  - `apps/api/scripts/e2e-smoke.mjs`
+  - `apps/api/scripts/e2e-table.mjs`
+  - `apps/api/scripts/e2e-discord-v1.mjs`
+- I casi di test ora usano la grammatica canonica e verificano anche il contenuto XML del DOCX generato, non solo la dimensione del file.
+
+### Verifiche eseguite
+- build API + workspace
+- smoke core con template canonico `{}` / `[{ } ...]` / `[[{ } ...]]`
+- smoke deterministic table-first con struttura tabellare a chiavi pulite
+- smoke Discord v1 / doc-generator backend con ZIP finale e DOCX realmente popolati
+
+### Esito
+- Parser, workflow, tabella e renderer sono riallineati sulla grammatica canonica.
+- La compatibilità legacy resta secondaria solo per non rompere template storici, ma la grammatica canonica del progetto è una sola.
+
+
 ## 2026-03-13 — ExecPlan 43 (Discord v1 template+table auto-continue)
 ### Audit e principio di riuso confermati
 - Verificati i mattoni standard già vivi e riusabili nel backend:

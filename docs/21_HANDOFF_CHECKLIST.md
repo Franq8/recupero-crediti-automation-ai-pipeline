@@ -36,7 +36,7 @@ Il progetto è in stato **avanzato e operativo** su backbone completo (API + Web
   - `Template + tabella`
 - `Solo template` declassato correttamente a funzione laterale di export struttura.
 - Prima tabella esplicita in entrambi gli iter via `POST /practices/:id/workflow/prepare`.
-- Seconda tabella esplicita solo quando il template contiene placeholder speciali via `POST /practices/:id/workflow/enrich`.
+- Seconda tabella esplicita solo quando il template contiene placeholder speciali canonici `[{campo} istruzione]` / `[[{campo} istruzione]]` via `POST /practices/:id/workflow/enrich`.
 - Warning/mismatch trattati in logica warn-and-proceed; niente blocchi UX impropri su incongruenze superabili.
 - Tabella workspace editabile e generazione sempre da riga finale corrente.
 - Validazione concreta completata su:

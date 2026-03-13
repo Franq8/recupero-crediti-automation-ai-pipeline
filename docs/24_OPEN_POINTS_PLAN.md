@@ -52,3 +52,15 @@
   - corretto blocco strict runner anche quando il template non espone flow `[ ]` / `[[ ]]` / `[[[ ]]]`.
 - Residuo non risolvibile senza input esterni:
   - manca nel repo un set finale di template/documenti reali o anonimizzati completi per collaudo prodotto definitivo su casi reali.
+
+## 9) Grammatica placeholder canonica
+- Stato: chiuso per il perimetro ExecPlan 45.
+- Grammatica canonica effettiva:
+  - extract → `{campo}`
+  - derive → `[{campo} istruzione]`
+  - generate → `[[{campo} istruzione]]`
+- Evidenza:
+  - parser centralizzato condiviso;
+  - export struttura tabellare con sole chiavi pulite;
+  - renderer DOCX allineato alla stessa grammatica;
+  - smoke core/table/discord-v1 aggiornati e passanti.

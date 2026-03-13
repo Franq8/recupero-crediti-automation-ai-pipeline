@@ -11,7 +11,9 @@
     "db:migrate": "prisma migrate dev",
     "smoke": "node scripts/e2e-smoke.mjs",
     "smoke:table": "node scripts/e2e-table.mjs",
-    "smoke:discord-v1": "node scripts/e2e-discord-v1.mjs"
+    "smoke:discord-v1": "node scripts/e2e-discord-v1.mjs",
+    "docgen:listen": "node scripts/doc-generator-discord-listener.mjs",
+    "docgen:send-fixtures": "node scripts/send-doc-generator-fixtures.mjs"
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",

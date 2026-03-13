@@ -34,7 +34,7 @@
 - `POST /practices/:id/import`
 - `GET /templates/:id/table-structure/xlsx|csv|json` (export struttura tabellare derivata dal template: solo `row_id` + chiavi template)
 - `POST /practices/:id/workflow/prepare` (prima tabella + primo mini-report; supporta iter documentale e iter tabellare)
-- `POST /practices/:id/workflow/enrich` (seconda tabella/final table solo se il template contiene placeholder speciali `[[ ]]` / `[[[ ]]]`)
+- `POST /practices/:id/workflow/enrich` (seconda tabella/final table solo se il template contiene placeholder speciali canonici `[{campo} istruzione]` / `[[{campo} istruzione]]`)
 
 ## Validation/report
 - `GET /practices/:id/summary`

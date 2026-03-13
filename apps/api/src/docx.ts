@@ -1,4 +1,5 @@
 import JSZip from 'jszip';
+import { listTemplatePlaceholderKeys, replaceCanonicalPlaceholders } from './placeholder-grammar.js';
 
 const XML_TARGETS = [
   'word/document.xml',
@@ -32,21 +33,12 @@ function extractMergeFieldName(instr: string): string | null {
 }
 
 function replaceMustacheAndChevrons(xml: string, replacements: Record<string, string>) {
-  let out = xml;
+  let out = replaceCanonicalPlaceholders(xml, replacements);
   for (const [key, value] of Object.entries(replacements)) {
-    out = out.replace(new RegExp(`\{\{\s*${key}\s*\}\}`, 'g'), value);
-    out = out.replace(new RegExp(`«\s*${key}\s*»`, 'g'), value);
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    out = out.replace(new RegExp(`\{\{\s*${escapedKey}\s*\}\}`, 'g'), value);
+    out = out.replace(new RegExp(`«\s*${escapedKey}\s*»`, 'g'), value);
   }
-
-  // Placeholder composti stile [[...]]
-  out = out.replace(/\[\[\s*([^\]]+?)\s*\]\]/g, (_m, rawKey) => {
-    const exact = replacements[String(rawKey)];
-    if (exact !== undefined) return exact;
-    const norm = String(rawKey).toLowerCase().replace(/\s+/g, ' ').trim();
-    const found = Object.entries(replacements).find(([k]) => k.toLowerCase().replace(/\s+/g, ' ').trim() === norm);
-    return found ? found[1] : _m;
-  });
-
   return out;
 }
 
@@ -108,6 +100,8 @@ export async function extractTemplateFields(docxBytes: Uint8Array): Promise<stri
 
     const chevronMatches = xml.matchAll(/«\s*([A-Za-z0-9_\.]+)\s*»/g);
     for (const m of chevronMatches) keys.add(m[1]);
+
+    for (const key of listTemplatePlaceholderKeys(xml)) keys.add(key);
   }
 
   return Array.from(keys).sort();
