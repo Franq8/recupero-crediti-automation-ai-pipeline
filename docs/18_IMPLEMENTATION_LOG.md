@@ -1,5 +1,65 @@
 # 18 — Implementation Log
 
+## 2026-03-13 — ExecPlan 43 (Discord v1 template+table auto-continue)
+### Audit e principio di riuso confermati
+- Verificati i mattoni standard già vivi e riusabili nel backend:
+  - `POST /practices/:id/workflow/prepare`
+  - `POST /practices/:id/workflow/enrich`
+  - `POST /practices/:id/generate-docx-from-row`
+  - `GET /practices/:id/table-rows`
+- Confermato che il motore corretto da riusare per Discord v1 è il workflow web/table-first già presente, senza reintrodurre il layer Discord legacy.
+- Confermato che i mini-report necessari al report postumo cumulativo sono già serviti da `prepare` e `enrich`; mancava solo l’orchestrazione auto-continue e il packaging finale.
+
+### Implementazione backend Discord v1
+- Introdotto un layer nuovo, minimo e pulito per Discord v1:
+  - helper dedicato `apps/api/src/discord-v1.ts`
+  - endpoint `POST /discord/v1/template-table-autocontinue`
+- Contratto input implementato:
+  - accetta **esattamente 1 `.docx`**
+  - accetta **esattamente 1 `.xlsx` o `.csv`**
+  - rifiuta input mancanti/multipli come errore tecnico chiaro.
+- Orchestrazione implementata usando il backend standard già esistente:
+  1. crea pratica
+  2. forza `DETERMINISTIC_TABLE_FIRST`
+  3. registra template e tabella
+  4. esegue `workflow/prepare`
+  5. se il template contiene placeholder speciali, esegue `workflow/enrich` in auto-continue
+  6. genera tutti i DOCX via `generate-docx-from-row`
+- Nessuna sosta intermedia lato Discord: il comportamento equivale a un auto-click su “continua” del flusso web.
+
+### Packaging ZIP finale
+- Implementato ZIP finale con:
+  - cartella `generated-docx/`
+  - `report.md` postumo cumulativo
+  - `summary.csv` riga-per-riga
+- Il report postumo somma davvero:
+  - esito prima fase / prima tabella
+  - esito seconda fase / seconda tabella, se esiste
+  - esito finale della generazione per ogni riga
+- Gli warning vengono riportati nel report ma non bloccano la generazione; gli errori tecnici restano tracciati per la sola riga affetta.
+
+### UX Discord minima
+- L’endpoint restituisce direttamente lo ZIP finale.
+- Espone anche header sintetici per il chiamante Discord:
+  - messaggio iniziale consigliato
+  - messaggio finale consigliato
+  - summary JSON con documenti generati / warning / errori
+  - `practiceId` tecnico di riferimento
+
+### Verifiche eseguite
+- `npm run -w @rca/api build` ✅
+- `npm run build` ✅
+- `npm run -w @rca/api smoke` ✅ (`SMOKE_OK`)
+- `npm run -w @rca/api smoke:table` ✅ (`TABLE_SMOKE_OK`)
+- `npm run -w @rca/api smoke:discord-v1` ✅ (`DISCORD_V1_OK`)
+  - caso template con placeholder semplici
+  - caso template con placeholder speciali e seconda fase auto-eseguita
+
+### Limiti residui reali
+- Discord v1 copre volutamente solo il contratto `1 template + 1 tabella`; niente editing tabellare o step-by-step da chat.
+- Se il template contiene placeholder speciali, la seconda fase viene eseguita ma senza un motore di derivazione esterno embedded nel repo: il layer Discord non inventa contenuti extra, mantiene il comportamento warn-and-proceed.
+- L’integrazione Discord lato bot/client resta minimale: questo step chiude il backend orchestrator + contratto file/output, non una UI conversazionale ricca.
+
 ## 2026-03-13 — ExecPlan 42 (warn-and-proceed matrix)
 ### Audit implementativo e correzione piano
 - Riesaminati backend e frontend rispetto alla matrice finale di `docs/42_EXECPLAN_WARN_AND_PROCEED_MATRIX.md`.

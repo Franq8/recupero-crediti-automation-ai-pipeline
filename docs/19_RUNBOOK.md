@@ -56,8 +56,32 @@ Smoke tabella deterministic-first:
 - eseguire `npm run -w @rca/api smoke:table`
 - output atteso: `TABLE_SMOKE_OK`
 
+## Discord v1 — template + tabella in auto-continue
+- endpoint: `POST /discord/v1/template-table-autocontinue`
+- input multipart richiesto:
+  - `actor` opzionale
+  - **1 file `.docx`**
+  - **1 file `.xlsx` oppure `.csv`**
+- comportamento:
+  - crea una pratica tecnica dedicata
+  - usa `DETERMINISTIC_TABLE_FIRST`
+  - esegue `workflow/prepare`
+  - se servono placeholder speciali, esegue anche `workflow/enrich`
+  - genera tutti i DOCX finali senza fermate intermedie
+  - restituisce direttamente uno ZIP finale
+- output ZIP:
+  - `generated-docx/*.docx`
+  - `report.md`
+  - `summary.csv`
+- header utili restituiti:
+  - `x-rca-discord-practice-id`
+  - `x-rca-discord-summary`
+  - `x-rca-discord-initial-message`
+  - `x-rca-discord-final-message`
+
 ## Legacy purge completato
 - il layer Discord legacy è stato rimosso dal backend applicativo.
+- Discord v1 usa un endpoint nuovo e minimo, ma riusa il motore standard del web.
 - l’app espone solo percorsi web/API coerenti con la policy OpenClaw-only.
 
 ## Backup minimo consigliato

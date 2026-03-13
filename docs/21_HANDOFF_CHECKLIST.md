@@ -18,6 +18,7 @@ Il progetto è in stato **avanzato e operativo** su backbone completo (API + Web
 - [x] Audit timeline + quality gate
 - [x] Purge layer Discord legacy completato
 - [x] Docker + runbook + smoke tests
+- [x] Discord v1 backend auto-continue (`POST /discord/v1/template-table-autocontinue`) con ZIP finale + report postumo cumulativo
 
 ## Limiti residui reali
 1. Mancano nel repo i materiali finali reali/anonymized dello studio per chiudere una copertura prodotto al 100% su casi reali.
@@ -48,6 +49,7 @@ Il progetto è in stato **avanzato e operativo** su backbone completo (API + Web
 - Build: `npm run build`
 - Smoke core: `npm run -w @rca/api smoke`
 - Smoke table deterministic: `npm run -w @rca/api smoke:table`
+- Smoke Discord v1: `npm run -w @rca/api smoke:discord-v1`
 
 ## Criterio chiusura definitiva
 Il progetto si considera chiuso quando i 4 punti di validazione sopra sono completati senza errori bloccanti.

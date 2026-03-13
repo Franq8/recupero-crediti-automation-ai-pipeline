@@ -44,6 +44,9 @@
 - `GET /practices/:id/final-report`
 - `GET /practices/:id/audit?limit=...`
 
+## Discord v1
+- `POST /discord/v1/template-table-autocontinue` (multipart: esattamente 1 `.docx` + 1 `.xlsx|.csv`; auto-continue del workflow standard web; risposta `application/zip` con `report.md` + `summary.csv` + DOCX generati)
+
 ## Output
 - `POST /practices/:id/generate`
 - `POST /practices/:id/generate-docx`

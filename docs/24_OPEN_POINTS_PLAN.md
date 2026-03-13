@@ -29,7 +29,19 @@
 - Evidenza D3: eliminato `apps/api/src/llm-extractor.ts`; nessun riferimento runtime attivo residuo al modulo morto; policy OpenClaw-only mantenuta solo nel runtime vivo e nelle docs corrette.
 - Punto residuo area D: nessuno.
 
-## 7) Go-live finale / punti ancora aperti fuori codice
+## 7) Discord v1 template + tabella auto-continue
+- Stato: chiuso per il perimetro v1.
+- Evidenza backend:
+  - endpoint `POST /discord/v1/template-table-autocontinue`
+  - riuso del motore standard via `workflow/prepare`, `workflow/enrich`, `generate-docx-from-row`
+  - ZIP finale con `generated-docx/`, `report.md`, `summary.csv`
+  - smoke dedicato `npm run -w @rca/api smoke:discord-v1`
+- Residuo voluto:
+  - perimetro limitato a `1 template + 1 tabella`
+  - nessun editing/approvazione intermedia da Discord
+  - nessun arricchimento AI autonomo embedded oltre a quanto già disponibile nel backend.
+
+## 8) Go-live finale / punti ancora aperti fuori codice
 - Stato: parzialmente aperto solo sul piano di validazione materiali reali.
 - Chiuso lato tecnico:
   - build workspace OK;
