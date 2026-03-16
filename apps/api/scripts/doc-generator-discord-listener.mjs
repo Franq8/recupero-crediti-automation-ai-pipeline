@@ -33,7 +33,7 @@ const REGENERATE_REGEX = /\b(?:rigenera|regen|link)\s+([A-Za-z0-9-]{8,})\b/i;
 const execFileAsync = promisify(execFile);
 const OPENCLAW_AGENT = process.env.DOC_GENERATOR_OPENCLAW_AGENT || 'main';
 const OPENCLAW_SESSION_ID = process.env.DOC_GENERATOR_OPENCLAW_SESSION_ID || 'rca-doc-generator-special-placeholders';
-const OPENCLAW_ROW_CONCURRENCY = Math.max(1, Number.parseInt(process.env.DOC_GENERATOR_OPENCLAW_ROW_CONCURRENCY || '6', 10) || 6);
+const OPENCLAW_ROW_CONCURRENCY = Math.max(1, Number.parseInt(process.env.DOC_GENERATOR_OPENCLAW_ROW_CONCURRENCY || '12', 10) || 12);
 
 if (!BOT_TOKEN) {
   console.error('Missing Discord bot token. Set DISCORD_BOT_TOKEN or configure ~/.openclaw/openclaw.json');
