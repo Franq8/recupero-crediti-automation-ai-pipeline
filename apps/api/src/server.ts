@@ -13,6 +13,7 @@ import { extractTemplateInstructions } from './template-instructions.js';
 import { buildPromptFlows } from './prompt-pack.js';
 import { parseImportFileRows } from './importer.js';
 import {
+  buildTemplateTableStructure,
   buildTemplateTableStructureCsv,
   buildTemplateTableStructureJson,
   buildTemplateTableStructureXlsx
@@ -1715,12 +1716,19 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
     sampleRow: summarizeDiscordV1RowValues((importedRows[0] ?? {}) as Record<string, unknown>)
   });
 
+  const templateStructure = await buildTemplateTableStructure(Buffer.from(template.bytes));
+  const templateDrivenKeys = templateStructure.headers.filter((key) => key !== 'row_id');
+  const projectImportedRowToTemplate = (row: Record<string, unknown>) => {
+    const normalized = normalizeImportRow(row);
+    return Object.fromEntries(templateDrivenKeys.map((key) => [key, normalized[key] ?? ''])) as Record<string, unknown>;
+  };
+
   await prisma.tableRow.deleteMany({ where: { practiceId, source: 'import-batch' } });
   for (let idx = 0; idx < importedRows.length; idx++) {
     const sourceRow = importedRows[idx] as Record<string, unknown>;
     const rowIdRaw = sourceRow.row_id;
     const rowIndex = Number.isFinite(Number(rowIdRaw)) ? Number(rowIdRaw) : idx + 1;
-    const normalized = normalizeImportRow(sourceRow);
+    const projected = projectImportedRowToTemplate(sourceRow);
 
     await prisma.tableRow.upsert({
       where: { practiceId_rowIndex: { practiceId, rowIndex } },
@@ -1730,14 +1738,14 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
         rowIndex,
         source: 'import-batch',
         originMode: WorkingMode.DETERMINISTIC_TABLE_FIRST,
-        valuesJson: JSON.stringify(normalized),
+        valuesJson: JSON.stringify(projected),
         status: RowStatus.READY,
         reviewState: ReviewState.TODO
       },
       update: {
         source: 'import-batch',
         originMode: WorkingMode.DETERMINISTIC_TABLE_FIRST,
-        valuesJson: JSON.stringify(normalized),
+        valuesJson: JSON.stringify(projected),
         status: RowStatus.READY,
         reviewState: ReviewState.TODO,
         updatedAt: new Date()
@@ -1745,7 +1753,7 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
     });
   }
 
-  const activeEntriesCount = await upsertPracticeFieldsFromRow(practiceId, importedRows[0] as Record<string, unknown>, actor, table.filename);
+  const activeEntriesCount = await upsertPracticeFieldsFromRow(practiceId, projectImportedRowToTemplate(importedRows[0] as Record<string, unknown>), actor, table.filename);
   await prisma.storedFile.create({
     data: {
       id: crypto.randomUUID(),
@@ -1772,7 +1780,8 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
     practiceId,
     importedRows: importedRows.length,
     activeFields: activeEntriesCount,
-    firstRowColumns: Object.keys(normalizeImportRow((importedRows[0] ?? {}) as Record<string, unknown>)).length
+    firstRowColumns: templateDrivenKeys.length,
+    templateDrivenColumns: truncateList(templateDrivenKeys, 20)
   });
 
   const prepareRes = await app.inject({
