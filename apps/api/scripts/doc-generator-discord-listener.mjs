@@ -83,12 +83,46 @@ function stripJsonFences(text) {
   return fenced ? fenced[1].trim() : raw;
 }
 
-function extractJsonSlice(text) {
-  const raw = String(text || '').trim();
-  const start = raw.indexOf('{');
-  const end = raw.lastIndexOf('}');
-  if (start === -1 || end === -1 || end < start) return '';
-  return raw.slice(start, end + 1);
+function extractFirstJsonObject(text) {
+  const raw = String(text || '');
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+    if (start === -1) {
+      if (ch === '{') {
+        start = i;
+        depth = 1;
+      }
+      continue;
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return raw.slice(start, i + 1);
+    }
+  }
+
+  return '';
 }
 
 async function runOpenClawStructuredJson(prompt) {
@@ -104,9 +138,9 @@ async function runOpenClawStructuredJson(prompt) {
     maxBuffer: 10 * 1024 * 1024
   });
 
-  const payload = JSON.parse(extractJsonSlice(stdout));
+  const payload = JSON.parse(extractFirstJsonObject(stdout));
   const text = payload?.result?.payloads?.[0]?.text || '';
-  return JSON.parse(extractJsonSlice(stripJsonFences(text)));
+  return JSON.parse(extractFirstJsonObject(stripJsonFences(text)));
 }
 
 async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, tableFilename, tableMimeType }) {
