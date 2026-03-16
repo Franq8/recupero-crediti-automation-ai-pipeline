@@ -125,6 +125,28 @@ function extractFirstJsonObject(text) {
   return '';
 }
 
+function safePreview(text, max = 400) {
+  return String(text || '').replace(/\s+/g, ' ').slice(0, max);
+}
+
+function parseStructuredAgentText(text) {
+  const stripped = stripJsonFences(text).trim();
+  if (!stripped) return null;
+
+  try {
+    return JSON.parse(stripped);
+  } catch {}
+
+  const firstObject = extractFirstJsonObject(stripped);
+  if (!firstObject) return null;
+
+  try {
+    return JSON.parse(firstObject);
+  } catch {
+    return null;
+  }
+}
+
 async function runOpenClawStructuredJson(prompt) {
   const { stdout } = await execFileAsync('openclaw', [
     'agent',
@@ -138,9 +160,15 @@ async function runOpenClawStructuredJson(prompt) {
     maxBuffer: 10 * 1024 * 1024
   });
 
-  const payload = JSON.parse(extractFirstJsonObject(stdout));
+  const envelopeRaw = extractFirstJsonObject(stdout);
+  if (!envelopeRaw) throw new Error(`OpenClaw envelope missing JSON object. stdout=${safePreview(stdout)}`);
+  const payload = JSON.parse(envelopeRaw);
   const text = payload?.result?.payloads?.[0]?.text || '';
-  return JSON.parse(extractFirstJsonObject(stripJsonFences(text)));
+  const structured = parseStructuredAgentText(text);
+  if (!structured || typeof structured !== 'object') {
+    throw new Error(`OpenClaw structured payload missing/invalid JSON. text=${safePreview(text)}`);
+  }
+  return structured;
 }
 
 async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, tableFilename, tableMimeType }) {
@@ -175,11 +203,20 @@ async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, 
       JSON.stringify(rowValues, null, 2)
     ].join('\n\n');
 
-    const structured = await runOpenClawStructuredJson(prompt);
-    rowResults[String(rowIndex)] = {
-      deriveValues: structured?.deriveValues && typeof structured.deriveValues === 'object' ? structured.deriveValues : {},
-      generateValues: structured?.generateValues && typeof structured.generateValues === 'object' ? structured.generateValues : {}
-    };
+    try {
+      const structured = await runOpenClawStructuredJson(prompt);
+      rowResults[String(rowIndex)] = {
+        deriveValues: structured?.deriveValues && typeof structured.deriveValues === 'object' ? structured.deriveValues : {},
+        generateValues: structured?.generateValues && typeof structured.generateValues === 'object' ? structured.generateValues : {}
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log('openclaw.row.parse-failed', JSON.stringify({ rowIndex, message }));
+      rowResults[String(rowIndex)] = {
+        deriveValues: {},
+        generateValues: {}
+      };
+    }
   }
 
   return rowResults;
