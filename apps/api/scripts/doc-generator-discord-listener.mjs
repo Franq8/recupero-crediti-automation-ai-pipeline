@@ -304,33 +304,63 @@ async function handleRegenerateRequest(message) {
 }
 
 async function handleMessageCreate(message) {
-  if (!message || processedMessageIds.has(message.id)) return;
-  if (message.channel_id !== CHANNEL_ID) return;
-  if (message.guild_id !== GUILD_ID) return;
+  log('message.received', JSON.stringify({
+    id: message?.id ?? null,
+    channel_id: message?.channel_id ?? null,
+    guild_id: message?.guild_id ?? null,
+    author_bot: Boolean(message?.author?.bot),
+    attachment_count: normalizeAttachments(message?.attachments).length,
+    content_preview: String(message?.content || '').slice(0, 120)
+  }));
+  if (!message) return;
+  if (processedMessageIds.has(message.id)) {
+    log('message.skipped', JSON.stringify({ id: message.id, reason: 'already-processed' }));
+    return;
+  }
+  if (message.channel_id !== CHANNEL_ID) {
+    log('message.skipped', JSON.stringify({ id: message.id, reason: 'wrong-channel', channel_id: message.channel_id, expected: CHANNEL_ID }));
+    return;
+  }
+  if (message.guild_id !== GUILD_ID) {
+    log('message.skipped', JSON.stringify({ id: message.id, reason: 'wrong-guild', guild_id: message.guild_id, expected: GUILD_ID }));
+    return;
+  }
   const attachments = normalizeAttachments(message.attachments);
   const attachmentCount = attachments.length;
   if (attachmentCount === 0) {
+    log('message.regen-check', JSON.stringify({ id: message.id }));
     await handleRegenerateRequest(message);
     return;
   }
   if (message.author?.bot) {
-    if (!ALLOW_BOT_MESSAGES) return;
+    if (!ALLOW_BOT_MESSAGES) {
+      log('message.skipped', JSON.stringify({ id: message.id, reason: 'bot-message-disabled' }));
+      return;
+    }
     const kinds = attachments.map(classifyAttachment).filter(Boolean);
     const templateCount = kinds.filter((k) => k === AttachmentKind.TEMPLATE).length;
     const tableCount = kinds.filter((k) => k === AttachmentKind.TABLE).length;
-    if (!(attachmentCount === 2 && templateCount === 1 && tableCount === 1)) return;
+    if (!(attachmentCount === 2 && templateCount === 1 && tableCount === 1)) {
+      log('message.skipped', JSON.stringify({ id: message.id, reason: 'bot-message-invalid-attachments', attachmentCount, templateCount, tableCount }));
+      return;
+    }
   }
   processedMessageIds.add(message.id);
+  log('message.accepted', JSON.stringify({ id: message.id, attachmentCount }));
   if (processedMessageIds.size > 500) {
     const first = processedMessageIds.values().next().value;
     if (first) processedMessageIds.delete(first);
   }
 
   try {
+    log('batch.start', JSON.stringify({ id: message.id }));
     await runBatchFromMessage(message);
+    log('batch.done', JSON.stringify({ id: message.id }));
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack : '';
     log('message processing failed', text);
+    if (stack) log('message processing stack', stack);
     try {
       await sendChannelMessage(`Errore batch inatteso: ${text.slice(0, 1500)}`);
     } catch (sendError) {
