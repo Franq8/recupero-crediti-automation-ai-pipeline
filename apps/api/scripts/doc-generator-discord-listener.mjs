@@ -25,6 +25,7 @@ const API_BASE = DEFAULT_API_BASE.replace(/\/$/, '');
 const API_URL = `${API_BASE}/discord/v1/template-table-autocontinue`;
 const USER_AGENT = 'rca-doc-generator-listener/1.0';
 const ALLOW_BOT_MESSAGES = process.env.DOC_GENERATOR_ALLOW_BOT_MESSAGES === '1';
+const REGENERATE_REGEX = /\b(?:rigenera|regen|link)\s+([A-Za-z0-9-]{8,})\b/i;
 
 if (!BOT_TOKEN) {
   console.error('Missing Discord bot token. Set DISCORD_BOT_TOKEN or configure ~/.openclaw/openclaw.json');
@@ -92,16 +93,6 @@ async function sendChannelMessage(content, extra = {}) {
   });
 }
 
-async function sendChannelFile(content, fileName, bytes) {
-  const form = new FormData();
-  form.set('payload_json', JSON.stringify({ content, allowed_mentions: { parse: [] } }));
-  form.set('files[0]', new Blob([bytes], { type: 'application/zip' }), fileName);
-  return discordApi(`/channels/${CHANNEL_ID}/messages`, {
-    method: 'POST',
-    body: form
-  });
-}
-
 async function fetchBytes(url) {
   const res = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
   if (!res.ok) throw new Error(`Download failed ${res.status} for ${url}`);
@@ -140,11 +131,42 @@ async function runBatchFromMessage(message) {
     return;
   }
 
-  const zipBytes = new Uint8Array(await res.arrayBuffer());
+  const payload = await res.json();
   const finalMessage = res.headers.get('x-rca-discord-final-message') || 'Lavorazione completata.';
-  const practiceId = res.headers.get('x-rca-discord-practice-id');
+  const practiceId = payload?.data?.practiceId || res.headers.get('x-rca-discord-practice-id');
+  const download = payload?.data?.download;
+  if (!download?.url) {
+    await sendChannelMessage(`Errore batch: risposta senza link di download.${practiceId ? ` Practice: \`${practiceId}\`` : ''}`);
+    return;
+  }
+
   const suffix = practiceId ? `\nPractice: \`${practiceId}\`` : '';
-  await sendChannelFile(`${finalMessage}${suffix}`, `doc-generator-${practiceId || message.id}.zip`, zipBytes);
+  const retention = download.retainedUntil ? `\nRetention ZIP: fino a ${download.retainedUntil}` : '';
+  await sendChannelMessage(`${finalMessage}${suffix}\nDownload: ${download.url}\nValido fino a: ${download.expiresAt}\nMax download: ${download.maxDownloads}${retention}`);
+}
+
+async function handleRegenerateRequest(message) {
+  const content = String(message?.content || '').trim();
+  const match = content.match(REGENERATE_REGEX);
+  if (!match) return false;
+
+  const practiceId = match[1];
+  const res = await fetch(`${API_BASE}/discord/v1/download-batches/${encodeURIComponent(practiceId)}/regenerate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
+    body: JSON.stringify({ actor: `discord-doc-generator:${message.author?.username || 'unknown'}:${message.id}` })
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    await sendChannelMessage(`Rigenerazione fallita per \`${practiceId}\`: ${text.slice(0, 1500)}`);
+    return true;
+  }
+
+  const payload = await res.json();
+  const download = payload?.data?.download;
+  await sendChannelMessage(`Nuovo link per \`${practiceId}\`:\n${download.url}\nValido fino a: ${download.expiresAt}\nMax download: ${download.maxDownloads}\nRetention ZIP: fino a ${download.retainedUntil}`);
+  return true;
 }
 
 async function handleMessageCreate(message) {
@@ -153,7 +175,10 @@ async function handleMessageCreate(message) {
   if (message.guild_id !== GUILD_ID) return;
   const attachments = normalizeAttachments(message.attachments);
   const attachmentCount = attachments.length;
-  if (attachmentCount === 0) return;
+  if (attachmentCount === 0) {
+    await handleRegenerateRequest(message);
+    return;
+  }
   if (message.author?.bot) {
     if (!ALLOW_BOT_MESSAGES) return;
     const kinds = attachments.map(classifyAttachment).filter(Boolean);

@@ -1,4 +1,5 @@
 import JSZip from 'jszip';
+import { replaceCanonicalPlaceholders } from './placeholder-grammar.js';
 
 export type DiscordV1Attachment = {
   filename: string;
@@ -12,7 +13,43 @@ export type DiscordV1FinalSummary = {
   warningRows: number;
   errorRows: number;
   hasSecondPhase: boolean;
+  documentsWithMissingPlaceholders: number;
 };
+
+export type DiscordV1GenerationRow = {
+  rowIndex: number;
+  rowId?: string;
+  filename?: string;
+  status: 'generated' | 'error';
+  missingFields: number;
+  warnings: string[];
+  missingFieldKeys?: string[];
+  error?: string;
+};
+
+function normalizeValue(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'boolean') return value ? 'SI' : 'NO';
+  return String(value).trim();
+}
+
+function sanitizeFilenameSegment(value: string) {
+  return value
+    .replace(/[\\/:*?"<>|]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function splitExtension(filename: string) {
+  const match = filename.match(/^(.*?)(\.[A-Za-z0-9]+)$/);
+  if (!match) return { basename: filename, extension: '' };
+  return { basename: match[1], extension: match[2] };
+}
+
+function escapeCsv(value: unknown) {
+  return `"${String(value ?? '').replaceAll('"', '""')}"`;
+}
 
 export function classifyDiscordV1Attachments(files: DiscordV1Attachment[]) {
   const templates = files.filter((file) => file.filename.toLowerCase().endsWith('.docx'));
@@ -24,25 +61,80 @@ export function classifyDiscordV1Attachments(files: DiscordV1Attachment[]) {
   return { templates, tables };
 }
 
+export function buildDiscordV1FallbackFilename(input: {
+  templateFilename: string;
+  rowIndex: number;
+  practiceId?: string | null;
+  prefix?: string | null;
+}) {
+  const { templateFilename, rowIndex, practiceId, prefix } = input;
+  const { extension } = splitExtension(templateFilename);
+  const basePrefix = sanitizeFilenameSegment(String(prefix ?? '').trim()) || 'doc-generator';
+  const practiceSegment = sanitizeFilenameSegment(String(practiceId ?? '').trim());
+  const rowSegment = String(Math.max(1, Number(rowIndex) || 1)).padStart(3, '0');
+  const stableBase = practiceSegment ? `${basePrefix}_${practiceSegment}_row_${rowSegment}` : `${basePrefix}_row_${rowSegment}`;
+  return `${stableBase}${extension || '.docx'}`;
+}
+
+export function resolveDiscordV1OutputFilename(input: {
+  templateFilename: string;
+  rowIndex: number;
+  rowValues?: Record<string, unknown>;
+  namingPattern?: string | null;
+  practiceId?: string | null;
+  fallbackPrefix?: string | null;
+}) {
+  const { templateFilename, rowIndex, rowValues = {}, namingPattern, practiceId, fallbackPrefix } = input;
+  const { extension } = splitExtension(templateFilename);
+  const fallback = buildDiscordV1FallbackFilename({
+    templateFilename,
+    rowIndex,
+    practiceId,
+    prefix: fallbackPrefix
+  });
+
+  const trimmedPattern = String(namingPattern ?? '').trim();
+  if (!trimmedPattern) return fallback;
+
+  const replacements = Object.fromEntries(
+    Object.entries(rowValues).map(([key, value]) => [key, sanitizeFilenameSegment(normalizeValue(value))])
+  );
+
+  let rendered = replaceCanonicalPlaceholders(trimmedPattern, replacements);
+  rendered = rendered.replace(/\{\s*([^{}\[\]]+?)\s*\}/g, (_, rawKey) => {
+    const key = String(rawKey ?? '').trim();
+    const exact = replacements[key];
+    if (typeof exact === 'string') return exact;
+    const normalized = key.toLowerCase();
+    const found = Object.entries(replacements).find(([candidate]) => candidate.toLowerCase() === normalized);
+    return found?.[1] ?? '';
+  });
+
+  rendered = sanitizeFilenameSegment(rendered)
+    .replace(/\s+/g, ' ')
+    .replace(/^-+|-+$/g, '')
+    .trim();
+
+  if (!rendered) return fallback;
+  if (/\.[A-Za-z0-9]{2,5}$/.test(rendered)) return rendered;
+  return `${rendered}${extension || '.docx'}`;
+}
+
 export function buildDiscordV1ReportMarkdown(input: {
   practiceId: string;
   templateFilename: string;
   tableFilename: string;
+  namingPattern?: string | null;
   firstPhase: any;
   secondPhase: any | null;
-  generationRows: Array<{
-    rowIndex: number;
-    filename?: string;
-    status: 'generated' | 'error';
-    missingFields: number;
-    warnings: string[];
-    error?: string;
-  }>;
+  generationRows: DiscordV1GenerationRow[];
 }) {
-  const { practiceId, templateFilename, tableFilename, firstPhase, secondPhase, generationRows } = input;
+  const { practiceId, templateFilename, tableFilename, namingPattern, firstPhase, secondPhase, generationRows } = input;
   const generatedCount = generationRows.filter((row) => row.status === 'generated').length;
   const errorRows = generationRows.filter((row) => row.status === 'error').length;
   const warningRows = generationRows.filter((row) => row.warnings.length > 0 || row.missingFields > 0).length;
+  const documentsWithMissingPlaceholders = generationRows.filter((row) => row.missingFields > 0).length;
+  const problematicRows = generationRows.filter((row) => row.status === 'error' || row.missingFields > 0 || row.warnings.length > 0);
 
   const lines: string[] = [];
   lines.push('# Discord v1 post-run report');
@@ -50,9 +142,11 @@ export function buildDiscordV1ReportMarkdown(input: {
   lines.push(`- Practice ID: ${practiceId}`);
   lines.push(`- Template: ${templateFilename}`);
   lines.push(`- Table: ${tableFilename}`);
+  lines.push(`- Naming pattern: ${String(namingPattern ?? '').trim() || 'fallback standard (doc-generator_<practiceId>_row_<nnn>.docx)'}`);
   lines.push(`- Generated documents: ${generatedCount}/${generationRows.length}`);
   lines.push(`- Rows with warnings: ${warningRows}`);
   lines.push(`- Rows with errors: ${errorRows}`);
+  lines.push(`- Documents/rows with unpopulated placeholders: ${documentsWithMissingPlaceholders}`);
   lines.push('');
 
   lines.push('## Phase 1 — first table / prepare');
@@ -86,8 +180,26 @@ export function buildDiscordV1ReportMarkdown(input: {
   lines.push('');
 
   lines.push('## Phase 3 — final generation');
+  lines.push(`- Total problematic rows/documents: ${problematicRows.length}`);
+  if (problematicRows.length) {
+    lines.push('- Problematic documents overview:');
+    for (const row of problematicRows) {
+      const rowLabel = row.rowId ? `row ${row.rowIndex} (${row.rowId})` : `row ${row.rowIndex}`;
+      const fileLabel = row.filename ? ` -> ${row.filename}` : '';
+      const issueParts = [
+        row.status === 'error' ? 'generation error' : null,
+        row.missingFields > 0 ? `${row.missingFields} unpopulated placeholders` : null,
+        row.warnings.length > 0 ? `${row.warnings.length} warnings` : null
+      ].filter(Boolean);
+      lines.push(`  - ${rowLabel}${fileLabel}: ${issueParts.join('; ')}`);
+    }
+    lines.push('');
+  }
+
   for (const row of generationRows) {
-    lines.push(`- Row ${row.rowIndex}: ${row.status}${row.filename ? ` -> ${row.filename}` : ''}; missingFields=${row.missingFields}`);
+    const rowLabel = row.rowId ? `Row ${row.rowIndex} (${row.rowId})` : `Row ${row.rowIndex}`;
+    lines.push(`- ${rowLabel}: ${row.status}${row.filename ? ` -> ${row.filename}` : ''}; missingFields=${row.missingFields}`);
+    if (row.missingFieldKeys?.length) lines.push(`  - missing placeholder keys: ${row.missingFieldKeys.join(', ')}`);
     for (const warning of row.warnings) lines.push(`  - warning: ${warning}`);
     if (row.error) lines.push(`  - error: ${row.error}`);
   }
@@ -100,27 +212,44 @@ export function buildDiscordV1ReportMarkdown(input: {
   return lines.join('\n');
 }
 
-export function buildDiscordV1SummaryCsv(rows: Array<{
-  rowIndex: number;
-  status: 'generated' | 'error';
-  filename?: string;
-  missingFields: number;
-  warnings: string[];
-  error?: string;
-}>) {
-  const esc = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`;
+export function summarizeDiscordV1Columns(rows: Record<string, unknown>[]) {
+  const columnSet = new Set<string>();
+  for (const row of rows) {
+    for (const key of Object.keys(row ?? {})) {
+      if (key) columnSet.add(key);
+    }
+  }
+
+  return Array.from(columnSet).sort();
+}
+
+export function summarizeDiscordV1RowValues(rowValues: Record<string, unknown>, limit = 12) {
+  const entries = Object.entries(rowValues ?? {}).slice(0, limit);
+  return Object.fromEntries(
+    entries.map(([key, value]) => {
+      if (value === null || value === undefined) return [key, ''];
+      if (typeof value === 'string') return [key, value.length > 80 ? `${value.slice(0, 77)}...` : value];
+      if (typeof value === 'number' || typeof value === 'boolean') return [key, value];
+      return [key, `[${Array.isArray(value) ? 'array' : typeof value}]`];
+    })
+  );
+}
+
+export function buildDiscordV1SummaryCsv(rows: DiscordV1GenerationRow[]) {
   const lines = [
-    ['row_id', 'status', 'filename', 'missing_fields', 'warnings', 'error'].map(esc).join(',')
+    ['row_id', 'source_row_id', 'status', 'filename', 'missing_fields', 'missing_field_keys', 'warnings', 'error'].map(escapeCsv).join(',')
   ];
   for (const row of rows) {
     lines.push([
       row.rowIndex,
+      row.rowId ?? '',
       row.status,
       row.filename ?? '',
       row.missingFields,
+      (row.missingFieldKeys ?? []).join(' | '),
       row.warnings.join(' | '),
       row.error ?? ''
-    ].map(esc).join(','));
+    ].map(escapeCsv).join(','));
   }
   return `${lines.join('\n')}\n`;
 }
@@ -148,6 +277,7 @@ export function buildDiscordV1FinalSummary(rows: Array<{
     generatedCount: rows.filter((row) => row.status === 'generated').length,
     warningRows: rows.filter((row) => row.warnings.length > 0 || row.missingFields > 0).length,
     errorRows: rows.filter((row) => row.status === 'error').length,
-    hasSecondPhase
+    hasSecondPhase,
+    documentsWithMissingPlaceholders: rows.filter((row) => row.missingFields > 0).length
   };
 }

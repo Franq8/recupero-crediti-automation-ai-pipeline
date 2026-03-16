@@ -141,3 +141,24 @@ model AuditEvent {
   payloadJson String
   createdAt   DateTime @default(now())
 }
+
+model DiscordDownloadBatch {
+  id                 String   @id
+  practiceId         String   @unique
+  zipFilename        String
+  zipRelativePath    String
+  zipSha256          String
+  zipSizeBytes       Int
+  retainedUntil      DateTime
+  tokenHash          String
+  tokenExpiresAt     DateTime
+  tokenMaxDownloads  Int      @default(3)
+  tokenDownloadCount Int      @default(0)
+  createdBy          String
+  lastDownloadedAt   DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([retainedUntil])
+  @@index([tokenHash])
+}

@@ -1,5 +1,6 @@
 import pdf from 'pdf-parse';
 import mammoth from 'mammoth';
+import { extractSpreadsheetDocumentText } from './importer.js';
 
 export async function extractTextByMime(buf: Buffer, mime: string, filename: string): Promise<string> {
   const lower = filename.toLowerCase();
@@ -12,6 +13,9 @@ export async function extractTextByMime(buf: Buffer, mime: string, filename: str
     const out = await mammoth.extractRawText({ buffer: buf });
     return out.value || '';
   }
+
+  const spreadsheetText = await extractSpreadsheetDocumentText(filename, mime, buf);
+  if (spreadsheetText !== null) return spreadsheetText;
 
   return buf.toString('utf-8');
 }

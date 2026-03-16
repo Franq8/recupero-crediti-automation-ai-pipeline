@@ -1,5 +1,24 @@
 # 24 — Piano punti aperti (aggiornato)
 
+## Decisioni prodotto recenti da implementare / consolidare
+
+### Report: visibilità documenti con placeholder non popolati
+- In tutti i report utente rilevanti (web mini-report, report postumo Discord/ZIP, report finali) va esplicitato non solo il conteggio dei warning, ma anche il numero di documenti coinvolti e, quando possibile, i nomi/file target o identificativi delle righe/documenti in cui alcuni segnaposto non sono stati popolati.
+- Obiettivo: rendere immediatamente individuabili i documenti problematici senza costringere l’utente a dedurli dal solo conteggio globale.
+
+### Naming file generati — Discord v1
+- Nel flusso Discord `doc-generator`, oltre a template + tabella, l’utente dovrà poter fornire anche una regola di nomenclatura dei file generati.
+- Esempio: `Diffida Condifesa-{Socio}`
+- Regola:
+  - il testo statico fornito dall’utente resta invariato;
+  - gli eventuali segnaposto presenti nella regola di naming si popolano come normali placeholder tabellari/finali;
+  - il nome finale del file per ogni riga viene costruito da tale pattern.
+- Il report finale dovrà anche consentire di capire quale nome è stato assegnato ai documenti generati.
+
+### Naming file generati — Web
+- La stessa funzionalità di regola di nomenclatura va implementata anche nell’interfaccia web in una fase successiva.
+- Nota esplicita: al momento la decisione è presa; l’implementazione web è rinviata ma non opzionale.
+
 ## 1) Runner OpenClaw lato app
 - Stato: chiuso.
 - Evidenza: runner strict, blocco esplicito senza output esterni, audit `PIPELINE_RUN_BLOCKED`.

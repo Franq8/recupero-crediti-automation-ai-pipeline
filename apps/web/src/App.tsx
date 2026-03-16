@@ -533,7 +533,7 @@ export function App() {
                 </div>
               </>
             )}
-            <input type="file" multiple accept=".pdf,.docx,.txt" disabled={!currentPracticeId || loading || (workingMode === 'STANDARD_DOCUMENT_SET' && !selectedDocumentSetId)} onChange={onUploadPracticeFiles} />
+            <input type="file" multiple accept=".pdf,.docx,.txt,.xlsx,.csv" disabled={!currentPracticeId || loading || (workingMode === 'STANDARD_DOCUMENT_SET' && !selectedDocumentSetId)} onChange={onUploadPracticeFiles} />
           </div>
           <div className="stack">
             <label>Area tabella</label>

@@ -6,6 +6,8 @@ services:
     environment:
       DATABASE_URL: file:/data/dev.db
       PORT: 8787
+      PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-https://automazionerecuperi.lawlabs.cloud}
+      DISCORD_DOWNLOAD_STORAGE_DIR: ${DISCORD_DOWNLOAD_STORAGE_DIR:-/data/discord-downloads}
       DISCORD_OPERATIVE_CHANNEL_ID: ${DISCORD_OPERATIVE_CHANNEL_ID:-1471526846259527725}
     ports:
       - "8787:8787"
