@@ -197,13 +197,17 @@ export async function extractTemplateFields(docxBytes: Uint8Array): Promise<stri
     const mergeMatches = xml.matchAll(/MERGEFIELD\s+"?([A-Za-z0-9_\.]+)"?/g);
     for (const m of mergeMatches) keys.add(m[1]);
 
-    const mustacheMatches = xml.matchAll(/\{\{\s*([A-Za-z0-9_\.]+)\s*\}\}/g);
+    const textNodes = [...xml.matchAll(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g)].map((m) => m[1]);
+    const linearText = textNodes.join('');
+    if (!linearText) continue;
+
+    const mustacheMatches = linearText.matchAll(/\{\{\s*([A-Za-z0-9_\.]+)\s*\}\}/g);
     for (const m of mustacheMatches) keys.add(m[1]);
 
-    const chevronMatches = xml.matchAll(/«\s*([A-Za-z0-9_\.]+)\s*»/g);
+    const chevronMatches = linearText.matchAll(/«\s*([A-Za-z0-9_\.]+)\s*»/g);
     for (const m of chevronMatches) keys.add(m[1]);
 
-    for (const key of listTemplatePlaceholderKeys(xml)) keys.add(key);
+    for (const key of listTemplatePlaceholderKeys(linearText)) keys.add(key);
   }
 
   return Array.from(keys).sort();
