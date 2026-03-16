@@ -33,9 +33,10 @@ const ALLOW_BOT_MESSAGES = process.env.DOC_GENERATOR_ALLOW_BOT_MESSAGES === '1';
 const REGENERATE_REGEX = /\b(?:rigenera|regen|link)\s+([A-Za-z0-9-]{8,})\b/i;
 const execFileAsync = promisify(execFile);
 const OPENCLAW_AGENT = process.env.DOC_GENERATOR_OPENCLAW_AGENT || 'main';
+const OPENCLAW_USE_ISOLATED_SESSION_ONLY = process.env.DOC_GENERATOR_USE_ISOLATED_SESSION_ONLY === '1';
 const OPENCLAW_SESSION_ID = process.env.DOC_GENERATOR_OPENCLAW_SESSION_ID || 'rca-doc-generator-special-placeholders';
-const OPENCLAW_ROW_CONCURRENCY = Math.max(1, Number.parseInt(process.env.DOC_GENERATOR_OPENCLAW_ROW_CONCURRENCY || '12', 10) || 12);
-const OPENCLAW_ROWS_PER_PROMPT = Math.max(1, Number.parseInt(process.env.DOC_GENERATOR_OPENCLAW_ROWS_PER_PROMPT || '4', 10) || 4);
+const OPENCLAW_ROW_CONCURRENCY = Math.max(1, Number.parseInt(process.env.DOC_GENERATOR_OPENCLAW_ROW_CONCURRENCY || '2', 10) || 2);
+const OPENCLAW_ROWS_PER_PROMPT = Math.max(1, Number.parseInt(process.env.DOC_GENERATOR_OPENCLAW_ROWS_PER_PROMPT || '25', 10) || 25);
 
 if (!BOT_TOKEN) {
   console.error('Missing Discord bot token. Set DISCORD_BOT_TOKEN or configure ~/.openclaw/openclaw.json');
@@ -187,14 +188,22 @@ function summarizeBatchDiagnostics(diagnostics) {
 }
 
 async function runOpenClawStructuredJson(prompt, { sessionId = OPENCLAW_SESSION_ID } = {}) {
-  const { stdout } = await execFileAsync('openclaw', [
-    'agent',
-    '--agent', OPENCLAW_AGENT,
+  const args = [
+    'agent'
+  ];
+
+  if (!OPENCLAW_USE_ISOLATED_SESSION_ONLY) {
+    args.push('--agent', OPENCLAW_AGENT);
+  }
+
+  args.push(
     '--session-id', sessionId,
     '--thinking', 'off',
     '--json',
     '--message', prompt
-  ], {
+  );
+
+  const { stdout } = await execFileAsync('openclaw', args, {
     cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../..'),
     maxBuffer: 10 * 1024 * 1024
   });
@@ -576,5 +585,10 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-log('starting doc-generator listener', `channel=${CHANNEL_ID}`, `api=${API_URL}`);
+log(
+  'starting doc-generator listener',
+  `channel=${CHANNEL_ID}`,
+  `api=${API_URL}`,
+  `openclawSessionMode=${OPENCLAW_USE_ISOLATED_SESSION_ONLY ? 'isolated-session-id' : `agent:${OPENCLAW_AGENT}:main-session+custom-session-id`}`
+);
 connectGateway();
