@@ -1627,12 +1627,19 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
   const attachments: Array<{ filename: string; mimeType: string; bytes: Uint8Array }> = [];
   let actor = 'discord-v1';
   let namingPattern = '';
+  let openclawRowFlowResults: Record<string, { deriveValues?: Record<string, unknown>; generateValues?: Record<string, unknown> }> = {};
 
   for await (const part of parts) {
     if (part.type === 'field') {
       if (part.fieldname === 'actor' && String(part.value ?? '').trim()) actor = String(part.value).trim();
       if (['namingPattern', 'naming_pattern', 'filenamePattern', 'filename_pattern', 'fileNamingPattern', 'file_naming_pattern'].includes(part.fieldname) && String(part.value ?? '').trim()) {
         namingPattern = String(part.value).trim();
+      }
+      if (part.fieldname === 'openclawRowFlowResultsJson' && String(part.value ?? '').trim()) {
+        try {
+          const parsed = JSON.parse(String(part.value));
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) openclawRowFlowResults = parsed;
+        } catch {}
       }
       continue;
     }
@@ -1650,7 +1657,8 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
     attachmentNames: attachments.map((file) => file.filename),
     templateCount: templates.length,
     tableCount: tables.length,
-    namingPatternProvided: Boolean(String(namingPattern ?? '').trim())
+    namingPatternProvided: Boolean(String(namingPattern ?? '').trim()),
+    openclawRowFlowResultsProvided: Object.keys(openclawRowFlowResults).length
   });
   if (templates.length !== 1) return reply.badRequest('Discord v1 richiede esattamente 1 file template .docx');
   if (tables.length !== 1) return reply.badRequest('Discord v1 richiede esattamente 1 tabella .xlsx o .csv');
@@ -1794,28 +1802,60 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
 
   let enrichData: any = null;
   if (prepareJson.data?.hasSpecialPlaceholders) {
-    logDiscordV1Debug('workflow.enrich.started', {
-      practiceId,
-      rowIndex: 1,
-      specialPlaceholderKeys: truncateList((prepareJson.data?.specialInstructions ?? []).map((item: { key?: string }) => item.key ?? '').filter(Boolean))
-    });
-    const enrichRes = await app.inject({
-      method: 'POST',
-      url: `/practices/${practiceId}/workflow/enrich`,
-      payload: { actor, templateId, rowIndex: 1, deriveValues: {}, generateValues: {} }
-    });
-    const enrichJson = enrichRes.json();
-    logDiscordV1Debug('workflow.enrich.result', {
-      practiceId,
-      statusCode: enrichRes.statusCode,
-      derivedKeys: enrichJson.data?.derivedKeys ?? [],
-      generatedKeys: enrichJson.data?.generatedKeys ?? [],
-      warningCodes: (enrichJson.data?.warnings ?? []).map((warning: { code?: string }) => warning.code ?? 'unknown'),
-      returnedColumns: Object.keys(enrichJson.data?.row?.values ?? {}),
-      sampleValues: summarizeDiscordV1RowValues((enrichJson.data?.row?.values ?? {}) as Record<string, unknown>)
-    });
-    if (enrichRes.statusCode >= 400) return reply.code(enrichRes.statusCode).send(enrichJson);
-    enrichData = enrichJson.data ?? null;
+    const rowIndexes = Object.keys(openclawRowFlowResults)
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .sort((a, b) => a - b);
+
+    if (!rowIndexes.length) {
+      logDiscordV1Debug('workflow.enrich.skipped', {
+        practiceId,
+        reason: 'special-placeholders-present-but-no-openclaw-values',
+        specialPlaceholderKeys: truncateList((prepareJson.data?.specialInstructions ?? []).map((item: { key?: string }) => item.key ?? '').filter(Boolean))
+      });
+    } else {
+      const derivedKeys = new Set<string>();
+      const generatedKeys = new Set<string>();
+      for (const rowIndex of rowIndexes) {
+        const rowPayload = openclawRowFlowResults[String(rowIndex)] ?? {};
+        const deriveValues = normalizeImportRow((rowPayload.deriveValues ?? {}) as Record<string, unknown>);
+        const generateValues = normalizeImportRow((rowPayload.generateValues ?? {}) as Record<string, unknown>);
+        if (!Object.keys(deriveValues).length && !Object.keys(generateValues).length) continue;
+
+        logDiscordV1Debug('workflow.enrich.started', {
+          practiceId,
+          rowIndex,
+          deriveCount: Object.keys(deriveValues).length,
+          generateCount: Object.keys(generateValues).length,
+          specialPlaceholderKeys: truncateList((prepareJson.data?.specialInstructions ?? []).map((item: { key?: string }) => item.key ?? '').filter(Boolean))
+        });
+        const enrichRes = await app.inject({
+          method: 'POST',
+          url: `/practices/${practiceId}/workflow/enrich`,
+          payload: { actor, templateId, rowIndex, deriveValues, generateValues }
+        });
+        const enrichJson = enrichRes.json();
+        if (enrichRes.statusCode >= 400) return reply.code(enrichRes.statusCode).send(enrichJson);
+
+        for (const key of Object.keys(deriveValues)) derivedKeys.add(key);
+        for (const key of Object.keys(generateValues)) generatedKeys.add(key);
+      }
+
+      enrichData = {
+        executed: true,
+        rowCount: rowIndexes.length,
+        derivedKeys: Array.from(derivedKeys),
+        generatedKeys: Array.from(generatedKeys),
+        warnings: []
+      };
+      logDiscordV1Debug('workflow.enrich.result', {
+        practiceId,
+        rowCount: rowIndexes.length,
+        derivedKeys: Array.from(derivedKeys),
+        generatedKeys: Array.from(generatedKeys),
+        warningCodes: []
+      });
+    }
   } else {
     logDiscordV1Debug('workflow.enrich.skipped', {
       practiceId,

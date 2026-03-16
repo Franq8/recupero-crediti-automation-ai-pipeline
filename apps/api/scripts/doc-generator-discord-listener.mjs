@@ -2,6 +2,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { parseImportFileRows } from '../dist/importer.js';
+import { extractTemplateInstructions } from '../dist/template-instructions.js';
 
 const DEFAULT_GUILD_ID = '1465850645138637018';
 const DEFAULT_CHANNEL_ID = '1482018084020551883';
@@ -26,6 +30,9 @@ const API_URL = `${API_BASE}/discord/v1/template-table-autocontinue`;
 const USER_AGENT = 'rca-doc-generator-listener/1.0';
 const ALLOW_BOT_MESSAGES = process.env.DOC_GENERATOR_ALLOW_BOT_MESSAGES === '1';
 const REGENERATE_REGEX = /\b(?:rigenera|regen|link)\s+([A-Za-z0-9-]{8,})\b/i;
+const execFileAsync = promisify(execFile);
+const OPENCLAW_AGENT = process.env.DOC_GENERATOR_OPENCLAW_AGENT || 'main';
+const OPENCLAW_SESSION_ID = process.env.DOC_GENERATOR_OPENCLAW_SESSION_ID || 'rca-doc-generator-special-placeholders';
 
 if (!BOT_TOKEN) {
   console.error('Missing Discord bot token. Set DISCORD_BOT_TOKEN or configure ~/.openclaw/openclaw.json');
@@ -59,6 +66,81 @@ function classifyAttachment(att) {
   if (name.endsWith('.docx')) return AttachmentKind.TEMPLATE;
   if (name.endsWith('.xlsx') || name.endsWith('.csv')) return AttachmentKind.TABLE;
   return null;
+}
+
+function normalizeImportRow(row) {
+  const out = {};
+  for (const [key, value] of Object.entries(row || {})) {
+    if (!key || key === 'schema_version' || key === 'row_id') continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+function stripJsonFences(text) {
+  const raw = String(text || '').trim();
+  const fenced = raw.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return fenced ? fenced[1].trim() : raw;
+}
+
+async function runOpenClawStructuredJson(prompt) {
+  const { stdout } = await execFileAsync('openclaw', [
+    'agent',
+    '--agent', OPENCLAW_AGENT,
+    '--session-id', OPENCLAW_SESSION_ID,
+    '--thinking', 'off',
+    '--json',
+    '--message', prompt
+  ], {
+    cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../..'),
+    maxBuffer: 10 * 1024 * 1024
+  });
+
+  const payload = JSON.parse(stdout);
+  const text = payload?.result?.payloads?.[0]?.text || '';
+  return JSON.parse(stripJsonFences(text));
+}
+
+async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, tableFilename, tableMimeType }) {
+  const instructions = await extractTemplateInstructions(templateBytes);
+  const deriveItems = instructions.filter((item) => item.kind === 'derive').map((item) => ({ key: item.key, instruction: item.instruction || '' }));
+  const generateItems = instructions.filter((item) => item.kind === 'generate').map((item) => ({ key: item.key, instruction: item.instruction || '' }));
+
+  if (!deriveItems.length && !generateItems.length) return null;
+
+  const rows = await parseImportFileRows(tableFilename, tableMimeType, Buffer.from(tableBytes));
+  const rowResults = {};
+
+  for (let idx = 0; idx < rows.length; idx += 1) {
+    const sourceRow = rows[idx] || {};
+    const rowIdRaw = sourceRow.row_id;
+    const rowIndex = Number.isFinite(Number(rowIdRaw)) ? Number(rowIdRaw) : idx + 1;
+    const rowValues = normalizeImportRow(sourceRow);
+
+    const prompt = [
+      'Sei il motore OpenClaw per i segnaposti speciali del progetto recupero-crediti-automation-ai-pipeline.',
+      'Lavora solo sui dati della riga fornita.',
+      'Restituisci SOLO JSON valido, senza markdown, senza testo extra.',
+      'Se un valore non è determinabile dai dati della riga, usa stringa vuota.',
+      'OUTPUT SHAPE OBBLIGATORIA:',
+      JSON.stringify({ deriveValues: {}, generateValues: {} }, null, 2),
+      'ISTRUZIONI DERIVE:',
+      JSON.stringify(deriveItems, null, 2),
+      'ISTRUZIONI GENERATE:',
+      JSON.stringify(generateItems, null, 2),
+      `ROW_INDEX: ${rowIndex}`,
+      'ROW_VALUES:',
+      JSON.stringify(rowValues, null, 2)
+    ].join('\n\n');
+
+    const structured = await runOpenClawStructuredJson(prompt);
+    rowResults[String(rowIndex)] = {
+      deriveValues: structured?.deriveValues && typeof structured.deriveValues === 'object' ? structured.deriveValues : {},
+      generateValues: structured?.generateValues && typeof structured.generateValues === 'object' ? structured.generateValues : {}
+    };
+  }
+
+  return rowResults;
 }
 
 async function discordApi(pathname, init = {}, attempt = 0) {
@@ -120,10 +202,17 @@ async function runBatchFromMessage(message) {
   const [templateBytes, tableBytes] = await Promise.all([fetchBytes(template.url), fetchBytes(table.url)]);
 
   const namingPattern = String(message.content || '').trim();
+  const rowFlowResults = await computeSpecialPlaceholderRowResults({
+    templateBytes,
+    tableBytes,
+    tableFilename: table.filename,
+    tableMimeType: table.contentType
+  });
 
   const form = new FormData();
   form.set('actor', `discord-doc-generator:${message.author?.username || 'unknown'}:${message.id}`);
   if (namingPattern) form.set('namingPattern', namingPattern);
+  if (rowFlowResults) form.set('openclawRowFlowResultsJson', JSON.stringify(rowFlowResults));
   form.set('template', new Blob([templateBytes], { type: template.contentType }), template.filename);
   form.set('table', new Blob([tableBytes], { type: table.contentType }), table.filename);
 
