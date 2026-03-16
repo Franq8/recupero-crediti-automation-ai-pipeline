@@ -119,8 +119,11 @@ async function runBatchFromMessage(message) {
   const table = tables[0];
   const [templateBytes, tableBytes] = await Promise.all([fetchBytes(template.url), fetchBytes(table.url)]);
 
+  const namingPattern = String(message.content || '').trim();
+
   const form = new FormData();
   form.set('actor', `discord-doc-generator:${message.author?.username || 'unknown'}:${message.id}`);
+  if (namingPattern) form.set('namingPattern', namingPattern);
   form.set('template', new Blob([templateBytes], { type: template.contentType }), template.filename);
   form.set('table', new Blob([tableBytes], { type: table.contentType }), table.filename);
 
