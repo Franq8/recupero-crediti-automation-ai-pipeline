@@ -33,6 +33,7 @@ const REGENERATE_REGEX = /\b(?:rigenera|regen|link)\s+([A-Za-z0-9-]{8,})\b/i;
 const execFileAsync = promisify(execFile);
 const OPENCLAW_AGENT = process.env.DOC_GENERATOR_OPENCLAW_AGENT || 'main';
 const OPENCLAW_SESSION_ID = process.env.DOC_GENERATOR_OPENCLAW_SESSION_ID || 'rca-doc-generator-special-placeholders';
+const OPENCLAW_ROW_CONCURRENCY = Math.max(1, Number.parseInt(process.env.DOC_GENERATOR_OPENCLAW_ROW_CONCURRENCY || '6', 10) || 6);
 
 if (!BOT_TOKEN) {
   console.error('Missing Discord bot token. Set DISCORD_BOT_TOKEN or configure ~/.openclaw/openclaw.json');
@@ -181,8 +182,8 @@ async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, 
   const rows = await parseImportFileRows(tableFilename, tableMimeType, Buffer.from(tableBytes));
   const rowResults = {};
 
-  for (let idx = 0; idx < rows.length; idx += 1) {
-    const sourceRow = rows[idx] || {};
+  const tasks = rows.map((sourceRowRaw, idx) => async () => {
+    const sourceRow = sourceRowRaw || {};
     const rowIdRaw = sourceRow.row_id;
     const rowIndex = Number.isFinite(Number(rowIdRaw)) ? Number(rowIdRaw) : idx + 1;
     const rowValues = normalizeImportRow(sourceRow);
@@ -209,6 +210,7 @@ async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, 
         deriveValues: structured?.deriveValues && typeof structured.deriveValues === 'object' ? structured.deriveValues : {},
         generateValues: structured?.generateValues && typeof structured.generateValues === 'object' ? structured.generateValues : {}
       };
+      log('openclaw.row.done', JSON.stringify({ rowIndex }));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       log('openclaw.row.parse-failed', JSON.stringify({ rowIndex, message }));
@@ -217,6 +219,16 @@ async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, 
         generateValues: {}
       };
     }
+  });
+
+  for (let start = 0; start < tasks.length; start += OPENCLAW_ROW_CONCURRENCY) {
+    const chunk = tasks.slice(start, start + OPENCLAW_ROW_CONCURRENCY);
+    await Promise.all(chunk.map((task) => task()));
+    log('openclaw.chunk.done', JSON.stringify({
+      completed: Math.min(start + OPENCLAW_ROW_CONCURRENCY, tasks.length),
+      total: tasks.length,
+      concurrency: OPENCLAW_ROW_CONCURRENCY
+    }));
   }
 
   return rowResults;
