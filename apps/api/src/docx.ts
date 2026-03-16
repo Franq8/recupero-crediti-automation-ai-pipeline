@@ -31,6 +31,15 @@ function normalizeValue(value: unknown): string {
   return String(value);
 }
 
+function isWordArtifactKey(key: string) {
+  const trimmed = String(key || '').trim();
+  if (!trimmed) return true;
+  if (/^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}$/i.test(trimmed)) return true;
+  if (/^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}$/i.test(trimmed.replace(/[{}]/g, ''))) return true;
+  if (/[<>]/.test(trimmed)) return true;
+  return false;
+}
+
 function extractMergeFieldName(instr: string): string | null {
   const m = instr.match(/MERGEFIELD\s+"?([A-Za-z0-9_\.]+)"?/i);
   return m?.[1] ?? null;
@@ -195,19 +204,30 @@ export async function extractTemplateFields(docxBytes: Uint8Array): Promise<stri
     if (!xml) continue;
 
     const mergeMatches = xml.matchAll(/MERGEFIELD\s+"?([A-Za-z0-9_\.]+)"?/g);
-    for (const m of mergeMatches) keys.add(m[1]);
+    for (const m of mergeMatches) {
+      const key = String(m[1] ?? '').trim();
+      if (!isWordArtifactKey(key)) keys.add(key);
+    }
 
     const textNodes = [...xml.matchAll(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g)].map((m) => m[1]);
     const linearText = textNodes.join('');
     if (!linearText) continue;
 
     const mustacheMatches = linearText.matchAll(/\{\{\s*([A-Za-z0-9_\.]+)\s*\}\}/g);
-    for (const m of mustacheMatches) keys.add(m[1]);
+    for (const m of mustacheMatches) {
+      const key = String(m[1] ?? '').trim();
+      if (!isWordArtifactKey(key)) keys.add(key);
+    }
 
     const chevronMatches = linearText.matchAll(/«\s*([A-Za-z0-9_\.]+)\s*»/g);
-    for (const m of chevronMatches) keys.add(m[1]);
+    for (const m of chevronMatches) {
+      const key = String(m[1] ?? '').trim();
+      if (!isWordArtifactKey(key)) keys.add(key);
+    }
 
-    for (const key of listTemplatePlaceholderKeys(linearText)) keys.add(key);
+    for (const key of listTemplatePlaceholderKeys(linearText)) {
+      if (!isWordArtifactKey(key)) keys.add(key);
+    }
   }
 
   return Array.from(keys).sort();

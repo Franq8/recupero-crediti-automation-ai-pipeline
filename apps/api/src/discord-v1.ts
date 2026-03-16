@@ -175,7 +175,7 @@ export function buildDiscordV1ReportMarkdown(input: {
     }
   } else {
     lines.push('- Executed: no');
-    lines.push('- Reason: no special placeholders in template');
+    lines.push(`- Reason: ${firstPhase?.hasSpecialPlaceholders ? 'special placeholders detected, but no derive/generate values were provided by OpenClaw/AI' : 'no special placeholders in template'}`);
   }
   lines.push('');
 

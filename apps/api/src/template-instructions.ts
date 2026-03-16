@@ -14,7 +14,7 @@ export async function extractTemplateInstructions(docxBytes: Uint8Array): Promis
     const xml = await zip.file(name)?.async('text');
     if (!xml) continue;
     const textNodes = [...xml.matchAll(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g)].map((m) => m[1]);
-    if (textNodes.length) chunks.push(textNodes.join(' '));
+    if (textNodes.length) chunks.push(textNodes.join(''));
   }
 
   return parseTemplatePlaceholders(chunks.join(' '));

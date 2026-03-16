@@ -81,6 +81,22 @@ test('discord v1 report highlights problematic documents and missing placeholder
   assert.match(report, /row 1 \(A-1\) -> Diffida-Mario Rossi\.docx: 2 unpopulated placeholders; 1 warnings/);
   assert.match(report, /row 2 \(A-2\) -> Diffida-Luigi Verdi\.docx: generation error/);
   assert.match(report, /missing placeholder keys: indirizzo, cf/);
+  assert.match(report, /Reason: no special placeholders in template/);
+});
+
+test('discord v1 report states when special placeholders exist but no OpenClaw values were provided', () => {
+  const report = buildDiscordV1ReportMarkdown({
+    practiceId: 'P-TEST',
+    templateFilename: 'template.docx',
+    tableFilename: 'table.csv',
+    firstPhase: { mode: 'DETERMINISTIC_TABLE_FIRST', comparison: { outcome: 'match' }, hasSpecialPlaceholders: true, nextAction: 'enrich-final-table' },
+    secondPhase: null,
+    generationRows: []
+  });
+
+  assert.match(report, /Special placeholders detected: yes/);
+  assert.match(report, /Executed: no/);
+  assert.match(report, /Reason: special placeholders detected, but no derive\/generate values were provided by OpenClaw\/AI/);
 });
 
 test('discord v1 summary csv exposes assigned filename and missing field keys', () => {
