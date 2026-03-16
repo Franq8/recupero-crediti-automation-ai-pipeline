@@ -5,7 +5,7 @@ import os from 'node:os';
 
 const DEFAULT_GUILD_ID = '1465850645138637018';
 const DEFAULT_CHANNEL_ID = '1482018084020551883';
-const DEFAULT_API_BASE = process.env.DOC_GENERATOR_API_BASE || 'http://127.0.0.1:8787';
+const DEFAULT_API_BASE = process.env.DOC_GENERATOR_API_BASE || 'https://automazionerecuperi.lawlabs.cloud/api';
 const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG_PATH || path.join(os.homedir(), '.openclaw', 'openclaw.json');
 
 function loadOpenClawToken() {

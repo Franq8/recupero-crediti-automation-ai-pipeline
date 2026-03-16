@@ -6,6 +6,7 @@ import { prisma } from './prisma.js';
 const DOWNLOAD_LINK_TTL_MS = 60 * 60 * 1000;
 const DOWNLOAD_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const DOWNLOAD_MAX_COUNT = 3;
+const CANONICAL_PUBLIC_API_BASE_URL = 'https://automazionerecuperi.lawlabs.cloud/api';
 
 function resolveStorageDir() {
   const configured = String(process.env.DISCORD_DOWNLOAD_STORAGE_DIR ?? '').trim();
@@ -13,17 +14,47 @@ function resolveStorageDir() {
   return path.resolve('/data/discord-downloads');
 }
 
+function isLocalhostLikeHost(value: string) {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1' || normalized.startsWith('localhost:') || normalized.startsWith('127.0.0.1:') || normalized.startsWith('[::1]');
+}
+
+function sanitizePublicApiBaseUrl(value: string) {
+  const normalized = value.trim().replace(/\/$/, '');
+  if (!normalized) return '';
+
+  try {
+    const url = new URL(normalized);
+    if (isLocalhostLikeHost(url.host) || isLocalhostLikeHost(url.hostname)) return '';
+    return url.toString().replace(/\/$/, '');
+  } catch {
+    return '';
+  }
+}
+
 export function buildPublicBaseUrl(headers?: Record<string, unknown>) {
-  const configured = String(process.env.PUBLIC_API_BASE_URL ?? '').trim().replace(/\/$/, '');
+  const configured = sanitizePublicApiBaseUrl(String(process.env.PUBLIC_API_BASE_URL ?? ''));
   if (configured) return configured;
 
   const forwardedProto = String(headers?.['x-forwarded-proto'] ?? '').trim();
   const forwardedHost = String(headers?.['x-forwarded-host'] ?? '').trim();
-  if (forwardedProto && forwardedHost) return `${forwardedProto}://${forwardedHost}`;
+  const forwardedPrefix = String(headers?.['x-forwarded-prefix'] ?? '').trim().replace(/\/$/, '');
+  if (forwardedHost) {
+    const proto = forwardedProto || (isLocalhostLikeHost(forwardedHost) ? 'http' : 'https');
+    const derived = sanitizePublicApiBaseUrl(`${proto}://${forwardedHost}${forwardedPrefix}`);
+    if (derived) return derived;
+  }
 
   const host = String(headers?.host ?? '').trim();
-  if (host) return `http://${host}`;
-  return 'http://127.0.0.1:8787';
+  if (host) {
+    const proto = forwardedProto || (isLocalhostLikeHost(host) ? 'http' : 'https');
+    const derived = sanitizePublicApiBaseUrl(`${proto}://${host}`);
+    if (derived) return derived;
+    if (isLocalhostLikeHost(host)) return `${proto}://${host}`.replace(/\/$/, '');
+  }
+
+  return CANONICAL_PUBLIC_API_BASE_URL;
 }
 
 function hashToken(token: string) {
