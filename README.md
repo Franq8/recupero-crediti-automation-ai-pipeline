@@ -20,8 +20,9 @@ Backbone implementato e funzionante (API + Web + DB + build OK).
 ## Avvio locale
 ```bash
 npm install
+npm run db:generate
 cp apps/api/.env.example apps/api/.env
-npm run db:migrate -- --name init_local
+npm run db:push
 npm run dev:api
 # altro terminale
 npm run dev:web

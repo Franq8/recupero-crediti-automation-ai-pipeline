@@ -12,6 +12,7 @@
     "dev:api": "npm run -w @rca/api dev",
     "dev:web": "npm run -w @rca/web dev",
     "db:generate": "npm run -w @rca/api db:generate",
+    "db:push": "npm run -w @rca/api db:push",
     "db:migrate": "npm run -w @rca/api db:migrate"
   }
 }

@@ -97,7 +97,43 @@ function normalizeExcelValue(v: ExcelJS.CellValue): unknown {
   return typeof v === 'string' ? v.trim() : v;
 }
 
-function splitCsvLine(line: string): string[] {
+function countDelimiterOccurrences(line: string, delimiter: string) {
+  let count = 0;
+  let inQ = false;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQ && line[i + 1] === '"') {
+        i += 1;
+      } else {
+        inQ = !inQ;
+      }
+      continue;
+    }
+    if (ch === delimiter && !inQ) count += 1;
+  }
+
+  return count;
+}
+
+function detectDelimitedTextSeparator(headerLine: string) {
+  const candidates = [',', ';', '\t'];
+  let best = ',';
+  let bestCount = -1;
+
+  for (const delimiter of candidates) {
+    const count = countDelimiterOccurrences(headerLine, delimiter);
+    if (count > bestCount) {
+      best = delimiter;
+      bestCount = count;
+    }
+  }
+
+  return best;
+}
+
+function splitCsvLine(line: string, delimiter = ','): string[] {
   const out: string[] = [];
   let cur = '';
   let inQ = false;
@@ -112,7 +148,7 @@ function splitCsvLine(line: string): string[] {
       }
       continue;
     }
-    if (ch === ',' && !inQ) {
+    if (ch === delimiter && !inQ) {
       out.push(cur);
       cur = '';
       continue;
@@ -126,9 +162,10 @@ function splitCsvLine(line: string): string[] {
 function parseDelimitedTextRows(text: string): Record<string, unknown>[] {
   const lines = text.split(/\r?\n/).filter(Boolean);
   if (lines.length < 2) return [];
-  const headers = splitCsvLine(lines[0]).map((h) => String(h ?? '').trim());
+  const delimiter = detectDelimitedTextSeparator(lines[0]);
+  const headers = splitCsvLine(lines[0], delimiter).map((h) => String(h ?? '').trim());
   return lines.slice(1).map((line) => {
-    const values = splitCsvLine(line);
+    const values = splitCsvLine(line, delimiter);
     const row: Record<string, unknown> = {};
     headers.forEach((h, i) => {
       if (!h) return;

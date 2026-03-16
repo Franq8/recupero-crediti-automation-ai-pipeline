@@ -1,10 +1,14 @@
 node_modules
 .env
 .env.*
+!apps/api/.env.example
 *.log
 dist
 build
 coverage
 apps/api/prisma/dev.db
 apps/api/prisma/dev.db-journal
+apps/api/dev.db
+apps/api/dev.db-journal
+apps/api/tmp
 uploads

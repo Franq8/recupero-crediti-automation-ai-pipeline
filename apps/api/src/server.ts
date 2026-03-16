@@ -142,7 +142,15 @@ async function upsertPracticeFieldsFromRow(practiceId: string, row: Record<strin
   return entries.length;
 }
 
-app.get('/health', async () => ({ ok: true }));
+app.get('/health', async (_request, reply) => {
+  try {
+    await prisma.practice.count();
+    return { ok: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return reply.code(503).send({ ok: false, error: message });
+  }
+});
 
 app.get('/project/go-live-report', async () => {
   const practices = await prisma.practice.count();

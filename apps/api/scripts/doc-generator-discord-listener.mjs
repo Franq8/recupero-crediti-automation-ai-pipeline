@@ -5,6 +5,7 @@ import os from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseImportFileRows } from '../dist/importer.js';
+import { analyzeStructuredBatchRows } from '../dist/doc-generator-openclaw.js';
 import { extractTemplateInstructions } from '../dist/template-instructions.js';
 
 const DEFAULT_GUILD_ID = '1465850645138637018';
@@ -149,18 +150,47 @@ function parseStructuredAgentText(text) {
   }
 }
 
-function normalizeStructuredRowResult(structured) {
-  return {
-    deriveValues: structured?.deriveValues && typeof structured.deriveValues === 'object' ? structured.deriveValues : {},
-    generateValues: structured?.generateValues && typeof structured.generateValues === 'object' ? structured.generateValues : {}
-  };
+function buildOpenClawSessionId(rowIndexes) {
+  const scope = rowIndexes.length ? rowIndexes.map((rowIndex) => String(rowIndex)).join('-') : 'no-rows';
+  const nonce = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return `${OPENCLAW_SESSION_ID}-${scope}-${nonce}`.slice(0, 180);
 }
 
-async function runOpenClawStructuredJson(prompt) {
+function buildSpecialPlaceholderPrompt({ deriveItems, generateItems, batch }) {
+  return [
+    'Sei il motore OpenClaw per i segnaposti speciali del progetto recupero-crediti-automation-ai-pipeline.',
+    'Lavora solo sui dati delle righe fornite.',
+    'Restituisci SOLO JSON valido, senza markdown, senza testo extra.',
+    'Per ogni riga restituisci deriveValues e generateValues.',
+    'Se un valore non è determinabile dai dati della riga, usa stringa vuota.',
+    'OUTPUT SHAPE OBBLIGATORIA:',
+    JSON.stringify({ rows: { '1': { deriveValues: {}, generateValues: {} } } }, null, 2),
+    'ISTRUZIONI DERIVE:',
+    JSON.stringify(deriveItems, null, 2),
+    'ISTRUZIONI GENERATE:',
+    JSON.stringify(generateItems, null, 2),
+    'ROWS:',
+    JSON.stringify(batch.map((entry) => ({ rowIndex: entry.rowIndex, values: entry.rowValues })), null, 2)
+  ].join('\n\n');
+}
+
+function summarizeBatchDiagnostics(diagnostics) {
+  return diagnostics
+    .filter((item) => item.missingDeriveKeys.length || item.missingGenerateKeys.length)
+    .map((item) => ({
+      rowIndex: item.rowIndex,
+      deriveKeys: item.deriveKeys,
+      generateKeys: item.generateKeys,
+      missingDeriveKeys: item.missingDeriveKeys,
+      missingGenerateKeys: item.missingGenerateKeys
+    }));
+}
+
+async function runOpenClawStructuredJson(prompt, { sessionId = OPENCLAW_SESSION_ID } = {}) {
   const { stdout } = await execFileAsync('openclaw', [
     'agent',
     '--agent', OPENCLAW_AGENT,
-    '--session-id', OPENCLAW_SESSION_ID,
+    '--session-id', sessionId,
     '--thinking', 'off',
     '--json',
     '--message', prompt
@@ -189,6 +219,8 @@ async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, 
 
   const rows = await parseImportFileRows(tableFilename, tableMimeType, Buffer.from(tableBytes));
   const rowResults = {};
+  const deriveKeys = deriveItems.map((item) => item.key);
+  const generateKeys = generateItems.map((item) => item.key);
 
   const rowEntries = rows.map((sourceRowRaw, idx) => {
     const sourceRow = sourceRowRaw || {};
@@ -197,40 +229,81 @@ async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, 
     return { rowIndex, rowValues: normalizeImportRow(sourceRow) };
   });
 
+  async function runBatch(batch) {
+    const prompt = buildSpecialPlaceholderPrompt({ deriveItems, generateItems, batch });
+    const analysis = analyzeStructuredBatchRows({
+      structuredRows: (await runOpenClawStructuredJson(prompt, {
+        sessionId: buildOpenClawSessionId(batch.map((entry) => entry.rowIndex))
+      }))?.rows,
+      rowIndexes: batch.map((entry) => entry.rowIndex),
+      deriveKeys,
+      generateKeys
+    });
+
+    return analysis;
+  }
+
   const batches = [];
   for (let i = 0; i < rowEntries.length; i += OPENCLAW_ROWS_PER_PROMPT) {
     batches.push(rowEntries.slice(i, i + OPENCLAW_ROWS_PER_PROMPT));
   }
 
   const tasks = batches.map((batch) => async () => {
-    const prompt = [
-      'Sei il motore OpenClaw per i segnaposti speciali del progetto recupero-crediti-automation-ai-pipeline.',
-      'Lavora solo sui dati delle righe fornite.',
-      'Restituisci SOLO JSON valido, senza markdown, senza testo extra.',
-      'Per ogni riga restituisci deriveValues e generateValues.',
-      'Se un valore non è determinabile dai dati della riga, usa stringa vuota.',
-      'OUTPUT SHAPE OBBLIGATORIA:',
-      JSON.stringify({ rows: { '1': { deriveValues: {}, generateValues: {} } } }, null, 2),
-      'ISTRUZIONI DERIVE:',
-      JSON.stringify(deriveItems, null, 2),
-      'ISTRUZIONI GENERATE:',
-      JSON.stringify(generateItems, null, 2),
-      'ROWS:',
-      JSON.stringify(batch.map((entry) => ({ rowIndex: entry.rowIndex, values: entry.rowValues })), null, 2)
-    ].join('\n\n');
+    async function retryRow(entry, reason) {
+      try {
+        const analysis = await runBatch([entry]);
+        rowResults[String(entry.rowIndex)] = analysis.rowResults[String(entry.rowIndex)];
+        log(
+          analysis.incompleteRowIndexes.length ? 'openclaw.row.retry.incomplete' : 'openclaw.row.retry.recovered',
+          JSON.stringify({
+            rowIndex: entry.rowIndex,
+            reason,
+            returnedRowKeys: analysis.returnedRowKeys,
+            unexpectedRowKeys: analysis.unexpectedRowKeys,
+            missingRowIndexes: analysis.missingRowIndexes,
+            incompleteRowIndexes: analysis.incompleteRowIndexes,
+            diagnostics: summarizeBatchDiagnostics(analysis.diagnostics)
+          })
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log('openclaw.row.retry.failed', JSON.stringify({ rowIndex: entry.rowIndex, reason, message }));
+        rowResults[String(entry.rowIndex)] = rowResults[String(entry.rowIndex)] || { deriveValues: {}, generateValues: {} };
+      }
+    }
 
     try {
-      const structured = await runOpenClawStructuredJson(prompt);
-      const structuredRows = structured?.rows && typeof structured.rows === 'object' ? structured.rows : {};
+      const analysis = await runBatch(batch);
       for (const entry of batch) {
-        rowResults[String(entry.rowIndex)] = normalizeStructuredRowResult(structuredRows[String(entry.rowIndex)]);
+        rowResults[String(entry.rowIndex)] = analysis.rowResults[String(entry.rowIndex)];
       }
-      log('openclaw.batch.done', JSON.stringify({ rowIndexes: batch.map((entry) => entry.rowIndex) }));
+
+      log('openclaw.batch.done', JSON.stringify({
+        rowIndexes: batch.map((entry) => entry.rowIndex),
+        returnedRowKeys: analysis.returnedRowKeys,
+        unexpectedRowKeys: analysis.unexpectedRowKeys,
+        missingRowIndexes: analysis.missingRowIndexes,
+        incompleteRowIndexes: analysis.incompleteRowIndexes,
+        diagnostics: summarizeBatchDiagnostics(analysis.diagnostics)
+      }));
+
+      if (!analysis.incompleteRowIndexes.length) return;
+
+      const retryIndexes = new Set(analysis.incompleteRowIndexes);
+      const retryEntries = batch.filter((entry) => retryIndexes.has(entry.rowIndex));
+      log('openclaw.batch.retrying-rows', JSON.stringify({
+        rowIndexes: batch.map((entry) => entry.rowIndex),
+        retryRowIndexes: retryEntries.map((entry) => entry.rowIndex),
+        reason: 'missing-row-results-or-required-keys'
+      }));
+      for (const entry of retryEntries) {
+        await retryRow(entry, 'batch-incomplete');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       log('openclaw.batch.parse-failed', JSON.stringify({ rowIndexes: batch.map((entry) => entry.rowIndex), message }));
       for (const entry of batch) {
-        rowResults[String(entry.rowIndex)] = { deriveValues: {}, generateValues: {} };
+        await retryRow(entry, 'batch-parse-failed');
       }
     }
   });
@@ -244,6 +317,10 @@ async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, 
       concurrency: OPENCLAW_ROW_CONCURRENCY,
       rowsPerPrompt: OPENCLAW_ROWS_PER_PROMPT
     }));
+  }
+
+  for (const entry of rowEntries) {
+    rowResults[String(entry.rowIndex)] = rowResults[String(entry.rowIndex)] || { deriveValues: {}, generateValues: {} };
   }
 
   return rowResults;

@@ -9,6 +9,7 @@
     "test": "npm run build && node --test dist/*.test.js",
     "start": "node dist/server.js",
     "db:generate": "prisma generate",
+    "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
     "smoke": "node scripts/e2e-smoke.mjs",
     "smoke:table": "node scripts/e2e-table.mjs",

@@ -6,10 +6,11 @@
 
 ## Avvio locale (sviluppo)
 1. `npm install`
-2. `cp apps/api/.env.example apps/api/.env`
-3. `npm run db:migrate -- --name init_local`
-4. Terminale A: `npm run dev:api`
-5. Terminale B: `npm run dev:web`
+2. `npm run db:generate`
+3. `cp apps/api/.env.example apps/api/.env`
+4. `npm run db:push`
+5. Terminale A: `npm run dev:api`
+6. Terminale B: `npm run dev:web`
 
 UI: `http://localhost:5173` (vite)
 API: `http://localhost:8787`
@@ -68,14 +69,14 @@ Smoke tabella deterministic-first:
   - esegue `workflow/prepare`
   - se servono placeholder speciali, esegue anche `workflow/enrich`
   - genera tutti i DOCX finali senza fermate intermedie
-  - restituisce direttamente uno ZIP finale
-- output ZIP:
-  - `generated-docx/*.docx`
-  - `report.md`
-  - `summary.csv`
+  - restituisce JSON con metadati finali + link download firmato
+- download ZIP:
+  - endpoint dedicato ritornato in `data.download.url`
+  - contiene `generated-docx/*.docx`, `report.md`, `summary.csv`
 - header utili restituiti:
   - `x-rca-discord-practice-id`
   - `x-rca-discord-summary`
+  - `x-rca-discord-download-url`
   - `x-rca-discord-initial-message`
   - `x-rca-discord-final-message`
 
@@ -96,7 +97,7 @@ Smoke tabella deterministic-first:
 - comportamento atteso:
   - accetta **solo** 1 `.docx` + 1 `.xlsx|.csv` nello stesso messaggio
   - nessuna risposta conversazionale/intermedia
-  - risposta finale con ZIP + messaggio sintetico
+  - risposta finale con link download + messaggio sintetico
 - test reale rapido con fixture già presenti:
   - `npm run -w @rca/api docgen:send-fixtures`
 

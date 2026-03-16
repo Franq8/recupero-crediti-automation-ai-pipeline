@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { promises as fs } from 'node:fs';
+import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { prisma } from './prisma.js';
 
@@ -11,7 +11,8 @@ const CANONICAL_PUBLIC_API_BASE_URL = 'https://automazionerecuperi.lawlabs.cloud
 function resolveStorageDir() {
   const configured = String(process.env.DISCORD_DOWNLOAD_STORAGE_DIR ?? '').trim();
   if (configured) return path.resolve(configured);
-  return path.resolve('/data/discord-downloads');
+  if (existsSync('/data')) return path.resolve('/data/discord-downloads');
+  return path.resolve(process.cwd(), 'tmp', 'discord-downloads');
 }
 
 function isLocalhostLikeHost(value: string) {

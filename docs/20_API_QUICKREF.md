@@ -45,7 +45,7 @@
 - `GET /practices/:id/audit?limit=...`
 
 ## Discord v1
-- `POST /discord/v1/template-table-autocontinue` (multipart: esattamente 1 `.docx` + 1 `.xlsx|.csv`; auto-continue del workflow standard web; risposta `application/zip` con `report.md` + `summary.csv` + DOCX generati)
+- `POST /discord/v1/template-table-autocontinue` (multipart: esattamente 1 `.docx` + 1 `.xlsx|.csv`; auto-continue del workflow standard web; risposta JSON con `data.download.url` e header `x-rca-discord-download-url` per scaricare lo ZIP finale)
 
 ## Output
 - `POST /practices/:id/generate`

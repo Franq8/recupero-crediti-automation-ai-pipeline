@@ -46,6 +46,16 @@ test('parseImportFileRows can merge all sheets when explicitly requested', async
   ]);
 });
 
+test('parseImportFileRows on csv auto-detects semicolon delimiters', async () => {
+  const rows = await parseImportFileRows(
+    'semicolon.csv',
+    'text/csv',
+    Buffer.from(['row_id;tribunale;di_numero', '1;Treviso;100/2026'].join('\n'))
+  );
+
+  assert.deepEqual(rows, [{ row_id: '1', tribunale: 'Treviso', di_numero: '100/2026' }]);
+});
+
 test('extractSpreadsheetDocumentText on xlsx includes all sheets as document content', async () => {
   const buf = await buildWorkbookBuffer();
 

@@ -12,4 +12,4 @@ RUN npm run -w @rca/api db:generate && npm run -w @rca/api build
 
 EXPOSE 8787
 WORKDIR /app/apps/api
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/server.js"]
+CMD ["sh", "-c", "npx prisma db push --skip-generate && node dist/server.js"]

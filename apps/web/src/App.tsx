@@ -1,6 +1,13 @@
 import { ChangeEvent, useEffect, useMemo, useState } from 'react';
 
-const API = 'http://localhost:8787';
+function resolveApiBaseUrl() {
+  const configured = String(import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/$/, '');
+  if (configured) return configured;
+  if (typeof window === 'undefined') return 'http://localhost:8787';
+  return `${window.location.protocol}//${window.location.hostname}:8787`;
+}
+
+const API = resolveApiBaseUrl();
 
 type WorkingMode = 'STANDARD_DOCUMENT_SET' | 'DETERMINISTIC_TABLE_FIRST';
 type Practice = { id: string; selectedTemplateId?: string | null; workingMode: WorkingMode };
