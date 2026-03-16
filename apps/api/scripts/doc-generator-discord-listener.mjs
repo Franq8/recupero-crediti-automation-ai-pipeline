@@ -83,6 +83,14 @@ function stripJsonFences(text) {
   return fenced ? fenced[1].trim() : raw;
 }
 
+function extractJsonSlice(text) {
+  const raw = String(text || '').trim();
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start === -1 || end === -1 || end < start) return '';
+  return raw.slice(start, end + 1);
+}
+
 async function runOpenClawStructuredJson(prompt) {
   const { stdout } = await execFileAsync('openclaw', [
     'agent',
@@ -96,9 +104,9 @@ async function runOpenClawStructuredJson(prompt) {
     maxBuffer: 10 * 1024 * 1024
   });
 
-  const payload = JSON.parse(stdout);
+  const payload = JSON.parse(extractJsonSlice(stdout));
   const text = payload?.result?.payloads?.[0]?.text || '';
-  return JSON.parse(stripJsonFences(text));
+  return JSON.parse(extractJsonSlice(stripJsonFences(text)));
 }
 
 async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, tableFilename, tableMimeType }) {
