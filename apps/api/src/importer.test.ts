@@ -56,6 +56,24 @@ test('parseImportFileRows on csv auto-detects semicolon delimiters', async () =>
   assert.deepEqual(rows, [{ row_id: '1', tribunale: 'Treviso', di_numero: '100/2026' }]);
 });
 
+test('parseImportFileRows on xlsx preserves displayed number and date formats', async () => {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Formato');
+  ws.addRow(['importo', 'data', 'testo']);
+  const row = ws.addRow([3948.94, new Date('2026-03-16T00:00:00Z'), 'ABC']);
+  row.getCell(1).numFmt = '#.##0,00';
+  row.getCell(2).numFmt = 'dd/mm/yyyy';
+
+  const data = await wb.xlsx.writeBuffer();
+  const rows = await parseImportFileRows(
+    'formatted.xlsx',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    Buffer.from(data as ArrayBuffer)
+  );
+
+  assert.deepEqual(rows, [{ importo: '3.948,94', data: '16/03/2026', testo: 'ABC' }]);
+});
+
 test('extractSpreadsheetDocumentText on xlsx includes all sheets as document content', async () => {
   const buf = await buildWorkbookBuffer();
 

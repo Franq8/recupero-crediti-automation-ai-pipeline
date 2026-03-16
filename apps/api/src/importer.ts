@@ -62,7 +62,7 @@ export async function extractSpreadsheetDocumentText(filename: string, mimeType:
         const lines: string[] = [];
         for (let rowNum = 1; rowNum <= ws.rowCount; rowNum++) {
           const row = ws.getRow(rowNum);
-          const values = Array.from({ length: row.cellCount }, (_, idx) => normalizeExcelValue(row.getCell(idx + 1).value));
+          const values = Array.from({ length: row.cellCount }, (_, idx) => normalizeExcelCell(row.getCell(idx + 1)));
           if (!values.some((value) => String(value ?? '').trim() !== '')) continue;
           lines.push(values.map((value) => String(value ?? '').trim()).join('\t'));
         }
@@ -95,6 +95,81 @@ function normalizeExcelValue(v: ExcelJS.CellValue): unknown {
     return String((v as any).toString?.() ?? '').trim();
   }
   return typeof v === 'string' ? v.trim() : v;
+}
+
+function pad2(value: number) {
+  return String(value).padStart(2, '0');
+}
+
+function formatExcelDate(value: Date, numFmt: string) {
+  const day = pad2(value.getDate());
+  const month = pad2(value.getMonth() + 1);
+  const year4 = String(value.getFullYear());
+  const year2 = year4.slice(-2);
+  const hour = pad2(value.getHours());
+  const minute = pad2(value.getMinutes());
+  const second = pad2(value.getSeconds());
+
+  let out = numFmt;
+  out = out.replace(/yyyy/gi, year4);
+  out = out.replace(/yy/gi, year2);
+  out = out.replace(/dd/gi, day);
+  out = out.replace(/mm/gi, month);
+  out = out.replace(/hh/gi, hour);
+  out = out.replace(/ss/gi, second);
+  out = out.replace(/mi|MM/g, minute);
+  out = out.replace(/^m$/g, month);
+  return out;
+}
+
+function formatExcelNumber(value: number, numFmt: string) {
+  const normalizedFmt = numFmt.replace(/\[[^\]]+\]/g, '').replace(/"[^"]*"/g, '');
+  const lastComma = normalizedFmt.lastIndexOf(',');
+  const lastDot = normalizedFmt.lastIndexOf('.');
+  const decimalSepIndex = Math.max(lastComma, lastDot);
+  const decimals = decimalSepIndex >= 0
+    ? (normalizedFmt.slice(decimalSepIndex + 1).match(/[0#]/g) || []).length
+    : 0;
+  const useItalianStyle = normalizedFmt.includes('#.##') || /0,0|#,##0,00/.test(normalizedFmt) || normalizedFmt.includes('€.');
+  if (useItalianStyle) {
+    return new Intl.NumberFormat('it-IT', {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+      useGrouping: true
+    }).format(value);
+  }
+  return new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+    useGrouping: /#,##|,##0/.test(numFmt)
+  }).format(value);
+}
+
+function formatExcelDisplayedValue(cell: ExcelJS.Cell): string | null {
+  const numFmt = String(cell.numFmt ?? '').trim();
+  if (!numFmt) return null;
+
+  const raw = cell.value;
+  const rawValue = normalizeExcelValue(raw);
+  const formulaResult = raw && typeof raw === 'object' && 'result' in (raw as any) ? (raw as any).result : null;
+  const effective = formulaResult ?? rawValue;
+
+  if (effective instanceof Date || raw instanceof Date) {
+    return formatExcelDate((effective instanceof Date ? effective : raw as Date), numFmt);
+  }
+
+  if (typeof effective === 'number') {
+    return formatExcelNumber(effective, numFmt);
+  }
+
+  return null;
+}
+
+function normalizeExcelCell(cell: ExcelJS.Cell): unknown {
+  const rawValue = normalizeExcelValue(cell.value);
+  const formattedValue = formatExcelDisplayedValue(cell);
+  if (formattedValue !== null) return formattedValue;
+  return rawValue;
 }
 
 function countDelimiterOccurrences(line: string, delimiter: string) {
@@ -188,8 +263,8 @@ function parseWorksheetRows(ws: ExcelJS.Worksheet): Record<string, unknown>[] {
     const row: Record<string, unknown> = {};
     headers.forEach((key, idx) => {
       if (!key) return;
-      const v = valueRow.getCell(idx + 1).value;
-      row[key] = normalizeExcelValue(v);
+      const cell = valueRow.getCell(idx + 1);
+      row[key] = normalizeExcelCell(cell);
     });
     if (Object.values(row).some((v) => String(v ?? '').trim() !== '')) out.push(row);
   }
