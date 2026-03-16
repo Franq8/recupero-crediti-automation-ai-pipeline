@@ -34,6 +34,7 @@ const execFileAsync = promisify(execFile);
 const OPENCLAW_AGENT = process.env.DOC_GENERATOR_OPENCLAW_AGENT || 'main';
 const OPENCLAW_SESSION_ID = process.env.DOC_GENERATOR_OPENCLAW_SESSION_ID || 'rca-doc-generator-special-placeholders';
 const OPENCLAW_ROW_CONCURRENCY = Math.max(1, Number.parseInt(process.env.DOC_GENERATOR_OPENCLAW_ROW_CONCURRENCY || '12', 10) || 12);
+const OPENCLAW_ROWS_PER_PROMPT = Math.max(1, Number.parseInt(process.env.DOC_GENERATOR_OPENCLAW_ROWS_PER_PROMPT || '4', 10) || 4);
 
 if (!BOT_TOKEN) {
   console.error('Missing Discord bot token. Set DISCORD_BOT_TOKEN or configure ~/.openclaw/openclaw.json');
@@ -148,6 +149,13 @@ function parseStructuredAgentText(text) {
   }
 }
 
+function normalizeStructuredRowResult(structured) {
+  return {
+    deriveValues: structured?.deriveValues && typeof structured.deriveValues === 'object' ? structured.deriveValues : {},
+    generateValues: structured?.generateValues && typeof structured.generateValues === 'object' ? structured.generateValues : {}
+  };
+}
+
 async function runOpenClawStructuredJson(prompt) {
   const { stdout } = await execFileAsync('openclaw', [
     'agent',
@@ -182,42 +190,48 @@ async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, 
   const rows = await parseImportFileRows(tableFilename, tableMimeType, Buffer.from(tableBytes));
   const rowResults = {};
 
-  const tasks = rows.map((sourceRowRaw, idx) => async () => {
+  const rowEntries = rows.map((sourceRowRaw, idx) => {
     const sourceRow = sourceRowRaw || {};
     const rowIdRaw = sourceRow.row_id;
     const rowIndex = Number.isFinite(Number(rowIdRaw)) ? Number(rowIdRaw) : idx + 1;
-    const rowValues = normalizeImportRow(sourceRow);
+    return { rowIndex, rowValues: normalizeImportRow(sourceRow) };
+  });
 
+  const batches = [];
+  for (let i = 0; i < rowEntries.length; i += OPENCLAW_ROWS_PER_PROMPT) {
+    batches.push(rowEntries.slice(i, i + OPENCLAW_ROWS_PER_PROMPT));
+  }
+
+  const tasks = batches.map((batch) => async () => {
     const prompt = [
       'Sei il motore OpenClaw per i segnaposti speciali del progetto recupero-crediti-automation-ai-pipeline.',
-      'Lavora solo sui dati della riga fornita.',
+      'Lavora solo sui dati delle righe fornite.',
       'Restituisci SOLO JSON valido, senza markdown, senza testo extra.',
+      'Per ogni riga restituisci deriveValues e generateValues.',
       'Se un valore non è determinabile dai dati della riga, usa stringa vuota.',
       'OUTPUT SHAPE OBBLIGATORIA:',
-      JSON.stringify({ deriveValues: {}, generateValues: {} }, null, 2),
+      JSON.stringify({ rows: { '1': { deriveValues: {}, generateValues: {} } } }, null, 2),
       'ISTRUZIONI DERIVE:',
       JSON.stringify(deriveItems, null, 2),
       'ISTRUZIONI GENERATE:',
       JSON.stringify(generateItems, null, 2),
-      `ROW_INDEX: ${rowIndex}`,
-      'ROW_VALUES:',
-      JSON.stringify(rowValues, null, 2)
+      'ROWS:',
+      JSON.stringify(batch.map((entry) => ({ rowIndex: entry.rowIndex, values: entry.rowValues })), null, 2)
     ].join('\n\n');
 
     try {
       const structured = await runOpenClawStructuredJson(prompt);
-      rowResults[String(rowIndex)] = {
-        deriveValues: structured?.deriveValues && typeof structured.deriveValues === 'object' ? structured.deriveValues : {},
-        generateValues: structured?.generateValues && typeof structured.generateValues === 'object' ? structured.generateValues : {}
-      };
-      log('openclaw.row.done', JSON.stringify({ rowIndex }));
+      const structuredRows = structured?.rows && typeof structured.rows === 'object' ? structured.rows : {};
+      for (const entry of batch) {
+        rowResults[String(entry.rowIndex)] = normalizeStructuredRowResult(structuredRows[String(entry.rowIndex)]);
+      }
+      log('openclaw.batch.done', JSON.stringify({ rowIndexes: batch.map((entry) => entry.rowIndex) }));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      log('openclaw.row.parse-failed', JSON.stringify({ rowIndex, message }));
-      rowResults[String(rowIndex)] = {
-        deriveValues: {},
-        generateValues: {}
-      };
+      log('openclaw.batch.parse-failed', JSON.stringify({ rowIndexes: batch.map((entry) => entry.rowIndex), message }));
+      for (const entry of batch) {
+        rowResults[String(entry.rowIndex)] = { deriveValues: {}, generateValues: {} };
+      }
     }
   });
 
@@ -225,9 +239,10 @@ async function computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, 
     const chunk = tasks.slice(start, start + OPENCLAW_ROW_CONCURRENCY);
     await Promise.all(chunk.map((task) => task()));
     log('openclaw.chunk.done', JSON.stringify({
-      completed: Math.min(start + OPENCLAW_ROW_CONCURRENCY, tasks.length),
-      total: tasks.length,
-      concurrency: OPENCLAW_ROW_CONCURRENCY
+      completedBatches: Math.min(start + OPENCLAW_ROW_CONCURRENCY, tasks.length),
+      totalBatches: tasks.length,
+      concurrency: OPENCLAW_ROW_CONCURRENCY,
+      rowsPerPrompt: OPENCLAW_ROWS_PER_PROMPT
     }));
   }
 
