@@ -34,17 +34,28 @@ export async function convertDocxBytesToPdf(input: { filename: string; bytes: Ui
   await fs.writeFile(sourcePath, Buffer.from(input.bytes));
 
   try {
-    await execFileAsync(
-      soffice,
-      ['--headless', '--nologo', '--nolockcheck', '--nodefault', '--nofirststartwizard', '--convert-to', 'pdf', '--outdir', outDir, sourcePath],
-      { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }
-    );
+    let conversionError: unknown = null;
+    try {
+      await execFileAsync(
+        soffice,
+        ['--headless', '--nologo', '--nolockcheck', '--nodefault', '--nofirststartwizard', '--convert-to', 'pdf', '--outdir', outDir, sourcePath],
+        { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }
+      );
+    } catch (error) {
+      conversionError = error;
+    }
 
     const { base } = splitBaseAndExt(input.filename);
     const pdfFilename = `${base}.pdf`;
     const pdfPath = path.join(outDir, pdfFilename);
-    const pdfBytes = new Uint8Array(await fs.readFile(pdfPath));
-    return { filename: pdfFilename, bytes: pdfBytes };
+
+    try {
+      const pdfBytes = new Uint8Array(await fs.readFile(pdfPath));
+      return { filename: pdfFilename, bytes: pdfBytes };
+    } catch {
+      if (conversionError) throw conversionError;
+      throw new Error(`PDF conversion failed: output file not found for ${input.filename}`);
+    }
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
   }
