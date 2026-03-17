@@ -191,20 +191,3 @@ model DiscordAutocontinueJob {
   @@index([practiceId])
 }
 
-model DiscordPdfJob {
-  id               String   @id
-  status           String
-  source           String
-  inputZip         Bytes
-  resultZip        Bytes?
-  provider         String?
-  workerId         String?
-  errorMessage     String?
-  claimedAt        DateTime?
-  startedAt        DateTime?
-  completedAt      DateTime?
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
-
-  @@index([status, createdAt])
-}

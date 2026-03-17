@@ -15,7 +15,6 @@
     "smoke:table": "node scripts/e2e-table.mjs",
     "smoke:discord-v1": "node scripts/e2e-discord-v1.mjs",
     "docgen:listen": "node scripts/doc-generator-discord-listener.mjs",
-    "docgen:pdf-worker": "node scripts/doc-generator-pdf-worker.mjs",
     "docgen:send-fixtures": "node scripts/send-doc-generator-fixtures.mjs"
   },
   "dependencies": {
