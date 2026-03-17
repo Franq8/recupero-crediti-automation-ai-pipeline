@@ -164,29 +164,47 @@ model DiscordDownloadBatch {
 }
 
 model DiscordAutocontinueJob {
-  id                        String   @id
-  status                    String
-  actor                     String
-  namingPattern             String?
+  id                         String   @id
+  status                     String
+  actor                      String
+  namingPattern              String?
   openclawRowFlowResultsJson String?
-  templateFilename          String
-  templateMimeType          String
-  templateBytes             Bytes
-  tableFilename             String
-  tableMimeType             String
-  tableBytes                Bytes
-  practiceId                String?
-  finalSummaryJson          String?
-  downloadUrl               String?
-  downloadExpiresAt         DateTime?
-  downloadMaxDownloads      Int?
-  downloadRetainedUntil     DateTime?
-  errorMessage              String?
-  startedAt                 DateTime?
-  completedAt               DateTime?
-  createdAt                 DateTime @default(now())
-  updatedAt                 DateTime @updatedAt
+  templateFilename           String
+  templateMimeType           String
+  templateBytes              Bytes
+  tableFilename              String
+  tableMimeType              String
+  tableBytes                 Bytes
+  practiceId                 String?
+  finalSummaryJson           String?
+  downloadUrl                String?
+  downloadExpiresAt          DateTime?
+  downloadMaxDownloads       Int?
+  downloadRetainedUntil      DateTime?
+  errorMessage               String?
+  startedAt                  DateTime?
+  completedAt                DateTime?
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
 
   @@index([status, createdAt])
   @@index([practiceId])
+}
+
+model DiscordPdfJob {
+  id               String   @id
+  status           String
+  source           String
+  inputZip         Bytes
+  resultZip        Bytes?
+  provider         String?
+  workerId         String?
+  errorMessage     String?
+  claimedAt        DateTime?
+  startedAt        DateTime?
+  completedAt      DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([status, createdAt])
 }

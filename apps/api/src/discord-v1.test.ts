@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import JSZip from 'jszip';
 import {
   buildDiscordV1FallbackFilename,
   buildDiscordV1FinalSummary,
   buildDiscordV1ReportMarkdown,
   buildDiscordV1SummaryCsv,
+  buildDiscordV1Zip,
   resolveDiscordV1OutputFilename,
   summarizeDiscordV1Columns,
   summarizeDiscordV1RowValues
@@ -129,6 +131,20 @@ test('discord v1 final summary counts rows with missing placeholders', () => {
   assert.equal(summary.errorRows, 1);
   assert.equal(summary.documentsWithMissingPlaceholders, 1);
   assert.equal(summary.hasSecondPhase, true);
+});
+
+test('discord v1 zip omits generated-pdf folder when no pdfs are provided', async () => {
+  const zipBytes = await buildDiscordV1Zip({
+    generatedDocs: [{ filename: 'a.docx', bytes: new Uint8Array([1, 2, 3]) }],
+    reportMarkdown: '# report',
+    summaryCsv: 'a,b\n'
+  });
+
+  const zip = await JSZip.loadAsync(zipBytes);
+  assert.equal(Boolean(zip.file('generated-docx/a.docx')), true);
+  assert.equal(Boolean(zip.file('report.md')), true);
+  assert.equal(Boolean(zip.file('summary.csv')), true);
+  assert.equal(Object.keys(zip.files).some((name) => name.startsWith('generated-pdf/')), false);
 });
 
 test('discord v1 debug summarizers keep logs compact and structured', () => {

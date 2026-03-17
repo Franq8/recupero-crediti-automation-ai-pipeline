@@ -6,6 +6,7 @@ Sistema per automatizzare la produzione atti (casistica iniziale: **atto di prec
 - workspace unico di revisione,
 - template library DOCX persistente,
 - generazione DOCX standard/fast,
+- export PDF preferenziale via **Microsoft Word su Mac mini** (fidelity path),
 - adapter operativo Discord.
 
 ## Stato attuale

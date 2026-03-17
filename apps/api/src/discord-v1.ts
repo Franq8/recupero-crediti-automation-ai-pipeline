@@ -262,9 +262,10 @@ export async function buildDiscordV1Zip(input: {
 }) {
   const zip = new JSZip();
   const docsFolder = zip.folder('generated-docx');
-  const pdfsFolder = zip.folder('generated-pdf');
+  const generatedPdfs = input.generatedPdfs ?? [];
+  const pdfsFolder = generatedPdfs.length ? zip.folder('generated-pdf') : null;
   for (const doc of input.generatedDocs) docsFolder?.file(doc.filename, doc.bytes);
-  for (const pdf of input.generatedPdfs ?? []) pdfsFolder?.file(pdf.filename, pdf.bytes);
+  for (const pdf of generatedPdfs) pdfsFolder?.file(pdf.filename, pdf.bytes);
   zip.file('report.md', input.reportMarkdown);
   zip.file('summary.csv', input.summaryCsv);
   return zip.generateAsync({ type: 'uint8array' });

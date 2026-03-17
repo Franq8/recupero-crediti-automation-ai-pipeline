@@ -71,10 +71,12 @@ Smoke tabella deterministic-first:
   - esegue `workflow/prepare`
   - se servono placeholder speciali, esegue anche `workflow/enrich`
   - genera tutti i DOCX finali senza fermate intermedie
+  - su Mac mini prova prima l'export PDF via **Microsoft Word / Save as PDF**; se Word non è disponibile il job continua comunque con i soli DOCX e annota il motivo nel report
   - restituisce JSON con metadati finali + link download firmato
 - download ZIP:
   - endpoint dedicato ritornato in `data.download.url`
-  - contiene `generated-docx/*.docx`, `report.md`, `summary.csv`
+  - contiene sempre `generated-docx/*.docx`, `report.md`, `summary.csv`
+  - contiene `generated-pdf/*.pdf` solo quando il renderer PDF Word è disponibile (oppure se è stato abilitato esplicitamente il fallback LibreOffice)
 - header utili restituiti:
   - `x-rca-discord-practice-id`
   - `x-rca-discord-summary`

@@ -9,7 +9,7 @@ import { sha256 } from './utils.js';
 import { FileKind, FieldStatus, WorkingMode, RowStatus, ReviewState } from '@prisma/client';
 import { extractTextByMime } from './document-content.js';
 import { extractTemplateFields, renderDocxTemplate } from './docx.js';
-import { convertDocxBytesToPdf } from './pdf.js';
+import { convertDocxBytesToPdf, getPdfConversionAvailability } from './pdf.js';
 import { extractTemplateInstructions } from './template-instructions.js';
 import { buildPromptFlows } from './prompt-pack.js';
 import { parseImportFileRows } from './importer.js';
@@ -39,6 +39,14 @@ import {
   regenerateDiscordDownloadLink,
   resolveDiscordDownloadByToken
 } from './discord-downloads.js';
+import {
+  buildDiscordPdfJobInputZip,
+  parseWorkerAuthHeader,
+  readDiscordPdfJobResultZip,
+  remotePdfWorkerEnabled,
+  workerAuthConfigured,
+  workerAuthMatches
+} from './discord-pdf-jobs.js';
 
 const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ', 10);
 const app = Fastify({ logger: true });
@@ -116,6 +124,66 @@ const discordAutocontinueActiveJobs = new Set<string>();
 function parseBooleanFormField(value: unknown) {
   const raw = String(value ?? '').trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+async function convertGeneratedDocsToPdfs(input: {
+  practiceId: string;
+  generatedDocs: Array<{ filename: string; bytes: Uint8Array }>;
+}) {
+  const generatedPdfs: Array<{ filename: string; bytes: Uint8Array }> = [];
+
+  if (remotePdfWorkerEnabled()) {
+    if (!workerAuthConfigured()) {
+      throw new Error('DOCGEN_PDF_REMOTE_MODE=worker requires DOCGEN_WORKER_SHARED_SECRET');
+    }
+
+    const job = await prisma.discordPdfJob.create({
+      data: {
+        id: crypto.randomUUID(),
+        status: 'QUEUED',
+        source: `discord-v1:${input.practiceId}`,
+        inputZip: Buffer.from(await buildDiscordPdfJobInputZip(input.generatedDocs))
+      }
+    });
+
+    const timeoutMs = parsePositiveInt(process.env.DOCGEN_PDF_REMOTE_TIMEOUT_MS, 10 * 60 * 1000);
+    const pollMs = parsePositiveInt(process.env.DOCGEN_PDF_REMOTE_POLL_MS, 1500);
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+      const current = await prisma.discordPdfJob.findUnique({ where: { id: job.id } });
+      if (!current) throw new Error(`Remote PDF job ${job.id} disappeared`);
+      if (current.status === 'COMPLETED') {
+        if (!current.resultZip) throw new Error(`Remote PDF job ${job.id} completed without result zip`);
+        const pdfs = await readDiscordPdfJobResultZip(new Uint8Array(current.resultZip));
+        generatedPdfs.push(...pdfs);
+        return { generatedPdfs, provider: current.provider || 'word' };
+      }
+      if (current.status === 'FAILED') {
+        throw new Error(current.errorMessage || `Remote PDF job ${job.id} failed`);
+      }
+    }
+
+    throw new Error(`Remote PDF job ${job.id} timed out after ${timeoutMs}ms`);
+  }
+
+  const pdfAvailability = await getPdfConversionAvailability();
+  if (!pdfAvailability.available) {
+    throw new Error(pdfAvailability.reason ?? 'PDF generation skipped: no renderer available');
+  }
+
+  for (const doc of input.generatedDocs) {
+    const pdf = await convertDocxBytesToPdf({ filename: doc.filename, bytes: doc.bytes });
+    generatedPdfs.push({ filename: pdf.filename, bytes: pdf.bytes });
+  }
+
+  return { generatedPdfs, provider: pdfAvailability.provider ?? 'word' };
 }
 
 async function executeDiscordV1Autocontinue(input: DiscordAutocontinueExecutionInput): Promise<DiscordAutocontinueExecutionResult> {
@@ -412,9 +480,25 @@ async function executeDiscordV1Autocontinue(input: DiscordAutocontinueExecutionI
   }
 
   const generatedPdfs: Array<{ filename: string; bytes: Uint8Array }> = [];
-  for (const doc of generatedDocs) generatedPdfs.push(await convertDocxBytesToPdf({ filename: doc.filename, bytes: doc.bytes }));
+  let pdfProvider: string | null = null;
+  let pdfWarning: string | null = null;
+  try {
+    const pdfResult = await convertGeneratedDocsToPdfs({ practiceId, generatedDocs });
+    generatedPdfs.push(...pdfResult.generatedPdfs);
+    pdfProvider = pdfResult.provider;
+    logDiscordV1Debug('generation.pdf.completed', {
+      practiceId,
+      provider: pdfProvider,
+      generatedPdfs: generatedPdfs.length,
+      remoteWorker: remotePdfWorkerEnabled()
+    });
+  } catch (error) {
+    pdfWarning = error instanceof Error ? error.message : 'PDF generation failed';
+    app.log.warn({ scope: 'discord-v1', practiceId, err: error, remoteWorker: remotePdfWorkerEnabled() }, 'discord-v1 pdf generation failed; continuing with DOCX only');
+  }
 
-  const reportMarkdown = buildDiscordV1ReportMarkdown({
+
+  const reportMarkdownBase = buildDiscordV1ReportMarkdown({
     practiceId,
     templateFilename: template.filename,
     tableFilename: table.filename,
@@ -423,6 +507,11 @@ async function executeDiscordV1Autocontinue(input: DiscordAutocontinueExecutionI
     secondPhase: enrichData,
     generationRows
   });
+  const reportMarkdown = pdfWarning
+    ? `${reportMarkdownBase}\n\n## PDF export\n- Status: skipped or partial\n- Reason: ${pdfWarning}\n`
+    : generatedPdfs.length
+      ? `${reportMarkdownBase}\n\n## PDF export\n- Status: generated\n- Provider: ${pdfProvider ?? 'unknown'}\n- Files: ${generatedPdfs.length}\n`
+      : reportMarkdownBase;
   const summaryCsv = buildDiscordV1SummaryCsv(generationRows);
   const zipBytes = await buildDiscordV1Zip({ generatedDocs, generatedPdfs, reportMarkdown, summaryCsv });
   const finalSummary = buildDiscordV1FinalSummary(generationRows, Boolean(enrichData));
@@ -2097,6 +2186,77 @@ app.get('/practices/:id/export/merge-data.csv', async (request, reply) => {
   reply.header('content-type', 'text/csv; charset=utf-8');
   reply.header('content-disposition', `attachment; filename="merge_${id}.csv"`);
   return csv;
+});
+
+function ensureDocgenWorkerAuthorized(request: any, reply: any) {
+  if (!workerAuthConfigured()) return reply.serviceUnavailable('DOCGEN worker auth is not configured on this API');
+  const authHeader = parseWorkerAuthHeader(request.headers['x-rca-docgen-worker-secret']);
+  if (!workerAuthMatches(authHeader)) return reply.forbidden('DOCGEN worker auth failed');
+  return null;
+}
+
+app.post('/discord/v1/pdf-jobs/claim', async (request, reply) => {
+  const authError = ensureDocgenWorkerAuthorized(request, reply);
+  if (authError) return authError;
+
+  const workerId = String((request.body as any)?.workerId ?? '').trim() || 'mac-mini-word-worker';
+  const queuedJob = await prisma.discordPdfJob.findFirst({ where: { status: 'QUEUED' }, orderBy: { createdAt: 'asc' } });
+  if (!queuedJob) return { ok: true, data: null };
+
+  const updated = await prisma.discordPdfJob.updateMany({
+    where: { id: queuedJob.id, status: 'QUEUED' },
+    data: { status: 'PROCESSING', workerId, claimedAt: new Date(), startedAt: new Date(), errorMessage: null }
+  });
+  if (!updated.count) return { ok: true, data: null };
+
+  const job = await prisma.discordPdfJob.findUnique({ where: { id: queuedJob.id } });
+  if (!job) return { ok: true, data: null };
+  return {
+    ok: true,
+    data: {
+      jobId: job.id,
+      source: job.source,
+      inputZipBase64: Buffer.from(job.inputZip).toString('base64'),
+      claimedAt: job.claimedAt?.toISOString() ?? new Date().toISOString()
+    }
+  };
+});
+
+app.post('/discord/v1/pdf-jobs/:jobId/complete', async (request, reply) => {
+  const authError = ensureDocgenWorkerAuthorized(request, reply);
+  if (authError) return authError;
+  const { jobId } = request.params as { jobId: string };
+  const body = (request.body as any) || {};
+  const resultZipBase64 = String(body.resultZipBase64 ?? '').trim();
+  if (!resultZipBase64) return reply.badRequest('Missing resultZipBase64');
+
+  await prisma.discordPdfJob.update({
+    where: { id: jobId },
+    data: {
+      status: 'COMPLETED',
+      provider: String(body.provider ?? '').trim() || 'word',
+      resultZip: Buffer.from(resultZipBase64, 'base64'),
+      errorMessage: null,
+      completedAt: new Date()
+    }
+  });
+
+  return { ok: true };
+});
+
+app.post('/discord/v1/pdf-jobs/:jobId/fail', async (request, reply) => {
+  const authError = ensureDocgenWorkerAuthorized(request, reply);
+  if (authError) return authError;
+  const { jobId } = request.params as { jobId: string };
+  const body = (request.body as any) || {};
+  const message = String(body.error ?? 'Remote PDF worker failed').slice(0, 4000);
+
+  await prisma.discordPdfJob.update({
+    where: { id: jobId },
+    data: { status: 'FAILED', errorMessage: message, completedAt: new Date() }
+  });
+
+  return { ok: true };
 });
 
 app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
