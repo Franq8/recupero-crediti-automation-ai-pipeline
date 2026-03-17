@@ -1967,9 +1967,10 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
     });
   }
 
-  const generatedPdfs = await Promise.all(
-    generatedDocs.map((doc) => convertDocxBytesToPdf({ filename: doc.filename, bytes: doc.bytes }))
-  );
+  const generatedPdfs = [] as Array<{ filename: string; bytes: Uint8Array }>;
+  for (const doc of generatedDocs) {
+    generatedPdfs.push(await convertDocxBytesToPdf({ filename: doc.filename, bytes: doc.bytes }));
+  }
 
   const reportMarkdown = buildDiscordV1ReportMarkdown({
     practiceId,

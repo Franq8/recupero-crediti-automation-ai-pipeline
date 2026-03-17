@@ -27,8 +27,10 @@ export async function convertDocxBytesToPdf(input: { filename: string; bytes: Ui
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'rca-pdf-'));
   const inputDir = path.join(tempRoot, 'input');
   const outDir = path.join(tempRoot, 'out');
+  const profileDir = path.join(tempRoot, 'profile');
   await fs.mkdir(inputDir, { recursive: true });
   await fs.mkdir(outDir, { recursive: true });
+  await fs.mkdir(profileDir, { recursive: true });
 
   const sourcePath = path.join(inputDir, input.filename);
   await fs.writeFile(sourcePath, Buffer.from(input.bytes));
@@ -38,8 +40,20 @@ export async function convertDocxBytesToPdf(input: { filename: string; bytes: Ui
     try {
       await execFileAsync(
         soffice,
-        ['--headless', '--nologo', '--nolockcheck', '--nodefault', '--nofirststartwizard', '--convert-to', 'pdf', '--outdir', outDir, sourcePath],
-        { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }
+        [
+          '--headless',
+          '--nologo',
+          '--nolockcheck',
+          '--nodefault',
+          '--nofirststartwizard',
+          `-env:UserInstallation=file://${profileDir}`,
+          '--convert-to',
+          'pdf',
+          '--outdir',
+          outDir,
+          sourcePath
+        ],
+        { timeout: 120000, maxBuffer: 10 * 1024 * 1024, env: { ...process.env, HOME: tempRoot } }
       );
     } catch (error) {
       conversionError = error;
