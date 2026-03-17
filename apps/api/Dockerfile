@@ -1,6 +1,8 @@
 FROM node:22-bookworm-slim AS base
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends libreoffice-writer libreoffice-core fonts-dejavu-core && rm -rf /var/lib/apt/lists/*
+
 COPY package*.json ./
 COPY apps/api/package*.json ./apps/api/
 COPY apps/web/package*.json ./apps/web/

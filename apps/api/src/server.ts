@@ -9,6 +9,7 @@ import { sha256 } from './utils.js';
 import { FileKind, FieldStatus, WorkingMode, RowStatus, ReviewState } from '@prisma/client';
 import { extractTextByMime } from './document-content.js';
 import { extractTemplateFields, renderDocxTemplate } from './docx.js';
+import { convertDocxBytesToPdf } from './pdf.js';
 import { extractTemplateInstructions } from './template-instructions.js';
 import { buildPromptFlows } from './prompt-pack.js';
 import { parseImportFileRows } from './importer.js';
@@ -1966,6 +1967,10 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
     });
   }
 
+  const generatedPdfs = await Promise.all(
+    generatedDocs.map((doc) => convertDocxBytesToPdf({ filename: doc.filename, bytes: doc.bytes }))
+  );
+
   const reportMarkdown = buildDiscordV1ReportMarkdown({
     practiceId,
     templateFilename: template.filename,
@@ -1976,7 +1981,7 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
     generationRows
   });
   const summaryCsv = buildDiscordV1SummaryCsv(generationRows);
-  const zipBytes = await buildDiscordV1Zip({ generatedDocs, reportMarkdown, summaryCsv });
+  const zipBytes = await buildDiscordV1Zip({ generatedDocs, generatedPdfs, reportMarkdown, summaryCsv });
   const finalSummary = buildDiscordV1FinalSummary(generationRows, Boolean(enrichData));
   const zipFilename = `discord_v1_${practiceId}.zip`;
   const persistedDownload = await persistDiscordDownloadBatch({

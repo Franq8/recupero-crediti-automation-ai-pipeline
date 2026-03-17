@@ -256,12 +256,15 @@ export function buildDiscordV1SummaryCsv(rows: DiscordV1GenerationRow[]) {
 
 export async function buildDiscordV1Zip(input: {
   generatedDocs: Array<{ filename: string; bytes: Uint8Array }>;
+  generatedPdfs?: Array<{ filename: string; bytes: Uint8Array }>;
   reportMarkdown: string;
   summaryCsv: string;
 }) {
   const zip = new JSZip();
   const docsFolder = zip.folder('generated-docx');
+  const pdfsFolder = zip.folder('generated-pdf');
   for (const doc of input.generatedDocs) docsFolder?.file(doc.filename, doc.bytes);
+  for (const pdf of input.generatedPdfs ?? []) pdfsFolder?.file(pdf.filename, pdf.bytes);
   zip.file('report.md', input.reportMarkdown);
   zip.file('summary.csv', input.summaryCsv);
   return zip.generateAsync({ type: 'uint8array' });
