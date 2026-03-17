@@ -2307,7 +2307,16 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
   const table = tables[0];
 
   if (runAsync) {
-    const job = await prisma.discordAutocontinueJob.create({
+    const existingJob = await prisma.discordAutocontinueJob.findFirst({
+      where: {
+        actor,
+        status: { in: ['QUEUED', 'PROCESSING', 'COMPLETED'] },
+        createdAt: { gte: new Date(Date.now() - 30 * 60 * 1000) }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const job = existingJob ?? await prisma.discordAutocontinueJob.create({
       data: {
         id: crypto.randomUUID(),
         status: 'QUEUED',
@@ -2322,7 +2331,7 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
         tableBytes: Buffer.from(table.bytes)
       }
     });
-    scheduleDiscordAutocontinueJob(job.id);
+    if (!existingJob) scheduleDiscordAutocontinueJob(job.id);
     const statusUrl = `/discord/v1/template-table-autocontinue/jobs/${job.id}`;
     reply.code(202);
     reply.header('x-rca-discord-job-id', job.id);
