@@ -86,6 +86,473 @@ function logDiscordV1Debug(event: string, payload: Record<string, unknown>) {
   app.log.debug({ scope: 'discord-v1', event, ...payload }, `discord-v1:${event}`);
 }
 
+
+type DiscordAutocontinueExecutionInput = {
+  actor: string;
+  namingPattern: string;
+  openclawRowFlowResults: Record<string, { deriveValues?: Record<string, unknown>; generateValues?: Record<string, unknown> }>;
+  template: { filename: string; mimeType: string; bytes: Uint8Array };
+  table: { filename: string; mimeType: string; bytes: Uint8Array };
+  requestHeaders?: Record<string, unknown>;
+};
+
+type DiscordAutocontinueExecutionResult = {
+  practiceId: string;
+  finalSummary: Record<string, unknown>;
+  download: {
+    url: string;
+    expiresAt: string;
+    maxDownloads: number;
+    retainedUntil: string;
+    filename: string;
+    storagePath: string;
+  };
+  initialMessage: string;
+  finalMessage: string;
+};
+
+const discordAutocontinueActiveJobs = new Set<string>();
+
+function parseBooleanFormField(value: unknown) {
+  const raw = String(value ?? '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
+async function executeDiscordV1Autocontinue(input: DiscordAutocontinueExecutionInput): Promise<DiscordAutocontinueExecutionResult> {
+  const { actor, namingPattern, openclawRowFlowResults, template, table } = input;
+  const createPracticeRes = await app.inject({
+    method: 'POST',
+    url: '/practices',
+    payload: { actor, caseType: 'precetto_di', schemaVer: '1.0.0' }
+  });
+  const createPracticeJson = createPracticeRes.json();
+  if (createPracticeRes.statusCode >= 400) throw new Error(createPracticeJson?.error ?? JSON.stringify(createPracticeJson));
+  const practiceId = createPracticeJson.data.id as string;
+  logDiscordV1Debug('practice.created', { practiceId, actor, templateFilename: template.filename, tableFilename: table.filename });
+
+  await app.inject({
+    method: 'POST',
+    url: `/practices/${practiceId}/mode`,
+    payload: { actor, mode: 'DETERMINISTIC_TABLE_FIRST' }
+  });
+
+  const latestTemplate = await prisma.template.findFirst({ where: { name: 'discord-v1-template' }, orderBy: { version: 'desc' } });
+  const createdTemplate = await prisma.template.create({
+    data: {
+      id: crypto.randomUUID(),
+      name: 'discord-v1-template',
+      version: (latestTemplate?.version ?? 0) + 1,
+      filename: template.filename,
+      mimeType: template.mimeType,
+      sizeBytes: template.bytes.length,
+      sha256: sha256(Buffer.from(template.bytes)),
+      content: Buffer.from(template.bytes),
+      isActive: true
+    }
+  });
+  const templateId = createdTemplate.id;
+
+  const selectTemplateRes = await app.inject({
+    method: 'POST',
+    url: `/practices/${practiceId}/select-template`,
+    payload: { templateId, actor }
+  });
+  if (selectTemplateRes.statusCode >= 400) throw new Error(selectTemplateRes.json()?.error ?? JSON.stringify(selectTemplateRes.json()));
+
+  const importedRows = await parseImportFileRows(table.filename, table.mimeType, Buffer.from(table.bytes));
+  if (!importedRows.length) throw new Error('Import file has no data rows.');
+  logDiscordV1Debug('ingest.parsed-table', {
+    practiceId,
+    tableFilename: table.filename,
+    importedRows: importedRows.length,
+    importedColumns: summarizeDiscordV1Columns(importedRows as Record<string, unknown>[]),
+    sampleRow: summarizeDiscordV1RowValues((importedRows[0] ?? {}) as Record<string, unknown>)
+  });
+
+  const templateStructure = await buildTemplateTableStructure(Buffer.from(template.bytes));
+  const templateDrivenKeys = templateStructure.headers.filter((key) => key !== 'row_id');
+  const projectImportedRowToTemplate = (row: Record<string, unknown>) => {
+    const normalized = normalizeImportRow(row);
+    return Object.fromEntries(templateDrivenKeys.map((key) => [key, normalized[key] ?? ''])) as Record<string, unknown>;
+  };
+
+  await prisma.tableRow.deleteMany({ where: { practiceId, source: 'import-batch' } });
+  for (let idx = 0; idx < importedRows.length; idx++) {
+    const sourceRow = importedRows[idx] as Record<string, unknown>;
+    const rowIdRaw = sourceRow.row_id;
+    const rowIndex = Number.isFinite(Number(rowIdRaw)) ? Number(rowIdRaw) : idx + 1;
+    const projected = projectImportedRowToTemplate(sourceRow);
+
+    await prisma.tableRow.upsert({
+      where: { practiceId_rowIndex: { practiceId, rowIndex } },
+      create: {
+        id: crypto.randomUUID(),
+        practiceId,
+        rowIndex,
+        source: 'import-batch',
+        originMode: WorkingMode.DETERMINISTIC_TABLE_FIRST,
+        valuesJson: JSON.stringify(projected),
+        status: RowStatus.READY,
+        reviewState: ReviewState.TODO
+      },
+      update: {
+        source: 'import-batch',
+        originMode: WorkingMode.DETERMINISTIC_TABLE_FIRST,
+        valuesJson: JSON.stringify(projected),
+        status: RowStatus.READY,
+        reviewState: ReviewState.TODO,
+        updatedAt: new Date()
+      }
+    });
+  }
+
+  const activeEntriesCount = await upsertPracticeFieldsFromRow(practiceId, projectImportedRowToTemplate(importedRows[0] as Record<string, unknown>), actor, table.filename);
+  await prisma.storedFile.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId,
+      kind: FileKind.PRACTICE_IMPORT,
+      filename: table.filename,
+      mimeType: table.mimeType,
+      sizeBytes: table.bytes.length,
+      sha256: sha256(Buffer.from(table.bytes)),
+      content: Buffer.from(table.bytes)
+    }
+  });
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId,
+      actor,
+      action: 'IMPORT_FILE_APPLIED',
+      payloadJson: JSON.stringify({ filename: table.filename, importedRows: importedRows.length, activeFields: activeEntriesCount, ingestChannel: 'discord-v1' })
+    }
+  });
+  const importJson = { ok: true, data: { filename: table.filename, importedRows: importedRows.length, activeFields: activeEntriesCount, activeRowIndex: 1 } };
+  logDiscordV1Debug('workspace.populated', {
+    practiceId,
+    importedRows: importedRows.length,
+    activeFields: activeEntriesCount,
+    firstRowColumns: templateDrivenKeys.length,
+    templateDrivenColumns: truncateList(templateDrivenKeys, 20)
+  });
+
+  const prepareRes = await app.inject({
+    method: 'POST',
+    url: `/practices/${practiceId}/workflow/prepare`,
+    payload: { actor, mode: 'DETERMINISTIC_TABLE_FIRST', templateId }
+  });
+  const prepareJson = prepareRes.json();
+  logDiscordV1Debug('workflow.prepare.result', {
+    practiceId,
+    statusCode: prepareRes.statusCode,
+    outcome: prepareJson.data?.comparison?.outcome ?? null,
+    hasSpecialPlaceholders: Boolean(prepareJson.data?.hasSpecialPlaceholders),
+    nextAction: prepareJson.data?.nextAction ?? null,
+    warningCodes: (prepareJson.data?.warnings ?? []).map((warning: { code?: string }) => warning.code ?? 'unknown'),
+    comparison: prepareJson.data?.comparison
+      ? {
+          matchedCount: (prepareJson.data.comparison.matched ?? []).length,
+          missingCount: (prepareJson.data.comparison.missing ?? []).length,
+          extraCount: (prepareJson.data.comparison.extra ?? []).length,
+          missingColumns: truncateList(prepareJson.data.comparison.missing ?? []),
+          extraColumns: truncateList(prepareJson.data.comparison.extra ?? [])
+        }
+      : null
+  });
+  if (prepareRes.statusCode >= 400) throw new Error(prepareJson?.error ?? JSON.stringify(prepareJson));
+
+  let enrichData: any = null;
+  if (prepareJson.data?.hasSpecialPlaceholders) {
+    const rowIndexes = Object.keys(openclawRowFlowResults)
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .sort((a, b) => a - b);
+
+    if (!rowIndexes.length) {
+      logDiscordV1Debug('workflow.enrich.skipped', {
+        practiceId,
+        reason: 'special-placeholders-present-but-no-openclaw-values',
+        specialPlaceholderKeys: truncateList((prepareJson.data?.specialInstructions ?? []).map((item: { key?: string }) => item.key ?? '').filter(Boolean))
+      });
+    } else {
+      const derivedKeys = new Set<string>();
+      const generatedKeys = new Set<string>();
+      for (const rowIndex of rowIndexes) {
+        const rowPayload = openclawRowFlowResults[String(rowIndex)] ?? {};
+        const deriveValues = normalizeImportRow((rowPayload.deriveValues ?? {}) as Record<string, unknown>);
+        const generateValues = normalizeImportRow((rowPayload.generateValues ?? {}) as Record<string, unknown>);
+        if (!Object.keys(deriveValues).length && !Object.keys(generateValues).length) continue;
+
+        logDiscordV1Debug('workflow.enrich.started', {
+          practiceId,
+          rowIndex,
+          deriveCount: Object.keys(deriveValues).length,
+          generateCount: Object.keys(generateValues).length,
+          specialPlaceholderKeys: truncateList((prepareJson.data?.specialInstructions ?? []).map((item: { key?: string }) => item.key ?? '').filter(Boolean))
+        });
+        const enrichRes = await app.inject({
+          method: 'POST',
+          url: `/practices/${practiceId}/workflow/enrich`,
+          payload: { actor, templateId, rowIndex, deriveValues, generateValues }
+        });
+        const enrichJson = enrichRes.json();
+        if (enrichRes.statusCode >= 400) throw new Error(enrichJson?.error ?? JSON.stringify(enrichJson));
+
+        for (const key of Object.keys(deriveValues)) derivedKeys.add(key);
+        for (const key of Object.keys(generateValues)) generatedKeys.add(key);
+      }
+
+      enrichData = {
+        executed: true,
+        rowCount: rowIndexes.length,
+        derivedKeys: Array.from(derivedKeys),
+        generatedKeys: Array.from(generatedKeys),
+        warnings: []
+      };
+      logDiscordV1Debug('workflow.enrich.result', {
+        practiceId,
+        rowCount: rowIndexes.length,
+        derivedKeys: Array.from(derivedKeys),
+        generatedKeys: Array.from(generatedKeys),
+        warningCodes: []
+      });
+    }
+  } else {
+    logDiscordV1Debug('workflow.enrich.skipped', {
+      practiceId,
+      reason: 'no-special-placeholders'
+    });
+  }
+
+  const rowsRes = await app.inject({ method: 'GET', url: `/practices/${practiceId}/table-rows` });
+  const rowsJson = rowsRes.json();
+  if (rowsRes.statusCode >= 400) throw new Error(rowsJson?.error ?? JSON.stringify(rowsJson));
+  const rows = rowsJson.data ?? [];
+  logDiscordV1Debug('table.rows.ready', {
+    practiceId,
+    rowCount: rows.length,
+    columns: summarizeDiscordV1Columns(rows.map((row: { values?: Record<string, unknown> }) => (row.values ?? {}) as Record<string, unknown>)),
+    sampleRow: summarizeDiscordV1RowValues((rows[0]?.values ?? {}) as Record<string, unknown>)
+  });
+  logDiscordV1Debug('naming.rule.selected', {
+    practiceId,
+    namingMode: String(namingPattern ?? '').trim() ? 'custom-pattern' : 'fallback-standard',
+    namingPattern: String(namingPattern ?? '').trim() || null,
+    fallbackPatternExample: `doc-generator_${practiceId}_row_001.docx`
+  });
+
+  const generatedDocs: Array<{ filename: string; bytes: Uint8Array }> = [];
+  const generationRows: Array<{ rowIndex: number; rowId?: string; filename?: string; status: 'generated' | 'error'; missingFields: number; warnings: string[]; missingFieldKeys?: string[]; error?: string }> = [];
+  const templateFieldKeys = await extractTemplateFields(template.bytes);
+
+  for (const row of rows) {
+    const rowIndex = Number(row.rowIndex ?? 0);
+    const rowValues = (row.values ?? {}) as Record<string, unknown>;
+    const rowId = String(rowValues.row_id ?? '').trim() || undefined;
+    const genRes = await app.inject({
+      method: 'POST',
+      url: `/practices/${practiceId}/generate-docx-from-row`,
+      payload: { actor, rowIndex, templateId }
+    });
+
+    if (genRes.statusCode >= 400) {
+      const error = genRes.json().error ?? `HTTP ${genRes.statusCode}`;
+      logDiscordV1Debug('generation.row.error', {
+        practiceId,
+        rowIndex,
+        rowId: rowId ?? null,
+        statusCode: genRes.statusCode,
+        error
+      });
+      generationRows.push({
+        rowIndex,
+        rowId,
+        status: 'error',
+        missingFields: 0,
+        warnings: [],
+        error
+      });
+      continue;
+    }
+
+    const contentDisposition = String(genRes.headers['content-disposition'] ?? '');
+    const generatedFilename = contentDisposition.match(/filename="([^"]+)"/)?.[1] ?? `row_${rowIndex}.docx`;
+    const missingFields = Number(genRes.headers['x-rca-missing-fields'] ?? '0');
+    const missingFieldKeys = templateFieldKeys.filter((key) => emptyValue(rowValues[key]));
+    const filename = resolveDiscordV1OutputFilename({
+      templateFilename: generatedFilename,
+      rowIndex,
+      rowValues,
+      namingPattern,
+      practiceId,
+      fallbackPrefix: 'doc-generator'
+    });
+    const bytes = new Uint8Array(genRes.rawPayload);
+    logDiscordV1Debug('generation.row.completed', {
+      practiceId,
+      rowIndex,
+      rowId: rowId ?? null,
+      sourceFilename: generatedFilename,
+      assignedFilename: filename,
+      missingFields: Number.isFinite(missingFields) ? missingFields : 0,
+      missingFieldKeys: truncateList(missingFieldKeys),
+      rowValuePreview: summarizeDiscordV1RowValues(rowValues)
+    });
+    generatedDocs.push({ filename, bytes });
+    generationRows.push({
+      rowIndex,
+      rowId,
+      filename,
+      status: 'generated',
+      missingFields: Number.isFinite(missingFields) ? missingFields : 0,
+      missingFieldKeys,
+      warnings: missingFields > 0 ? [`${missingFields} placeholder template lasciati vuoti o incompleti`] : []
+    });
+  }
+
+  const generatedPdfs: Array<{ filename: string; bytes: Uint8Array }> = [];
+  for (const doc of generatedDocs) generatedPdfs.push(await convertDocxBytesToPdf({ filename: doc.filename, bytes: doc.bytes }));
+
+  const reportMarkdown = buildDiscordV1ReportMarkdown({
+    practiceId,
+    templateFilename: template.filename,
+    tableFilename: table.filename,
+    namingPattern,
+    firstPhase: prepareJson.data,
+    secondPhase: enrichData,
+    generationRows
+  });
+  const summaryCsv = buildDiscordV1SummaryCsv(generationRows);
+  const zipBytes = await buildDiscordV1Zip({ generatedDocs, generatedPdfs, reportMarkdown, summaryCsv });
+  const finalSummary = buildDiscordV1FinalSummary(generationRows, Boolean(enrichData));
+  const zipFilename = `discord_v1_${practiceId}.zip`;
+  const persistedDownload = await persistDiscordDownloadBatch({
+    practiceId,
+    zipFilename,
+    zipBytes,
+    actor
+  });
+  const publicBaseUrl = buildPublicBaseUrl(input.requestHeaders ?? {});
+  const downloadUrl = buildDiscordDownloadUrl(publicBaseUrl, persistedDownload.token);
+  logDiscordV1Debug('generation.completed', {
+    practiceId,
+    generatedDocs: generatedDocs.length,
+    zipBytes: zipBytes.length,
+    zipStoredAt: persistedDownload.absolutePath,
+    downloadUrl,
+    finalSummary
+  });
+
+  await prisma.auditEvent.create({
+    data: {
+      id: crypto.randomUUID(),
+      practiceId,
+      actor,
+      action: 'DISCORD_V1_AUTOCONTINUE_COMPLETED',
+      payloadJson: JSON.stringify({
+        templateFilename: template.filename,
+        tableFilename: table.filename,
+        namingPattern: namingPattern || null,
+        importedRows: importJson.data?.importedRows ?? rows.length,
+        zipFilename,
+        zipRelativePath: persistedDownload.batch.zipRelativePath,
+        retainedUntil: persistedDownload.retainedUntil,
+        tokenExpiresAt: persistedDownload.tokenExpiresAt,
+        finalSummary
+      })
+    }
+  });
+
+  return {
+    practiceId,
+    finalSummary,
+    download: {
+      url: downloadUrl,
+      expiresAt: persistedDownload.tokenExpiresAt.toISOString(),
+      maxDownloads: persistedDownload.batch.tokenMaxDownloads,
+      retainedUntil: persistedDownload.retainedUntil.toISOString(),
+      filename: zipFilename,
+      storagePath: persistedDownload.batch.zipRelativePath
+    },
+    initialMessage: 'Lavorazione Discord v1 avviata: template + tabella ricevuti, auto-continue attivo.',
+    finalMessage: `Esito Discord v1: ${finalSummary.generatedCount}/${finalSummary.totalRows} documenti generati, ${finalSummary.warningRows} righe con warning, ${finalSummary.errorRows} righe con errori.`
+  };
+}
+
+async function runDiscordAutocontinueJob(jobId: string) {
+  if (discordAutocontinueActiveJobs.has(jobId)) return;
+  discordAutocontinueActiveJobs.add(jobId);
+  try {
+    const job = await prisma.discordAutocontinueJob.findUnique({ where: { id: jobId } });
+    if (!job) return;
+    if (job.status === 'COMPLETED' || job.status === 'FAILED') return;
+
+    await prisma.discordAutocontinueJob.update({
+      where: { id: jobId },
+      data: { status: 'PROCESSING', startedAt: job.startedAt ?? new Date(), errorMessage: null }
+    });
+
+    let openclawRowFlowResults: Record<string, { deriveValues?: Record<string, unknown>; generateValues?: Record<string, unknown> }> = {};
+    if (job.openclawRowFlowResultsJson) {
+      try {
+        const parsed = JSON.parse(job.openclawRowFlowResultsJson);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) openclawRowFlowResults = parsed;
+      } catch {}
+    }
+
+    const result = await executeDiscordV1Autocontinue({
+      actor: job.actor,
+      namingPattern: job.namingPattern ?? '',
+      openclawRowFlowResults,
+      template: { filename: job.templateFilename, mimeType: job.templateMimeType, bytes: new Uint8Array(job.templateBytes) },
+      table: { filename: job.tableFilename, mimeType: job.tableMimeType, bytes: new Uint8Array(job.tableBytes) },
+      requestHeaders: { host: process.env.PUBLIC_BASE_URL || 'automazionerecuperi.lawlabs.cloud', 'x-forwarded-proto': 'https' }
+    });
+
+    await prisma.discordAutocontinueJob.update({
+      where: { id: jobId },
+      data: {
+        status: 'COMPLETED',
+        practiceId: result.practiceId,
+        finalSummaryJson: JSON.stringify(result.finalSummary),
+        downloadUrl: result.download.url,
+        downloadExpiresAt: new Date(result.download.expiresAt),
+        downloadMaxDownloads: result.download.maxDownloads,
+        downloadRetainedUntil: new Date(result.download.retainedUntil),
+        completedAt: new Date(),
+        errorMessage: null
+      }
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await prisma.discordAutocontinueJob.update({
+      where: { id: jobId },
+      data: { status: 'FAILED', errorMessage: message.slice(0, 4000), completedAt: new Date() }
+    });
+    app.log.error({ scope: 'discord-v1', jobId, err: error }, 'discord-v1 async job failed');
+  } finally {
+    discordAutocontinueActiveJobs.delete(jobId);
+  }
+}
+
+function scheduleDiscordAutocontinueJob(jobId: string) {
+  if (discordAutocontinueActiveJobs.has(jobId)) return;
+  setImmediate(() => {
+    void runDiscordAutocontinueJob(jobId);
+  });
+}
+
+async function resumePendingDiscordAutocontinueJobs() {
+  const pending = await prisma.discordAutocontinueJob.findMany({ where: { status: { in: ['QUEUED', 'PROCESSING'] } }, orderBy: { createdAt: 'asc' } });
+  for (const job of pending) {
+    if (job.status === 'PROCESSING') {
+      await prisma.discordAutocontinueJob.update({ where: { id: job.id }, data: { status: 'QUEUED' } });
+    }
+    scheduleDiscordAutocontinueJob(job.id);
+  }
+}
+
 async function getTemplateWorkflowShape(templateId: string) {
   const tpl = await prisma.template.findUnique({ where: { id: templateId } });
   if (!tpl) return null;
@@ -1637,6 +2104,7 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
   const attachments: Array<{ filename: string; mimeType: string; bytes: Uint8Array }> = [];
   let actor = 'discord-v1';
   let namingPattern = '';
+  let runAsync = false;
   let openclawRowFlowResults: Record<string, { deriveValues?: Record<string, unknown>; generateValues?: Record<string, unknown> }> = {};
 
   for await (const part of parts) {
@@ -1645,6 +2113,7 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
       if (['namingPattern', 'naming_pattern', 'filenamePattern', 'filename_pattern', 'fileNamingPattern', 'file_naming_pattern'].includes(part.fieldname) && String(part.value ?? '').trim()) {
         namingPattern = String(part.value).trim();
       }
+      if (['async', 'background', 'enqueue'].includes(part.fieldname)) runAsync = runAsync || parseBooleanFormField(part.value);
       if (part.fieldname === 'openclawRowFlowResultsJson' && String(part.value ?? '').trim()) {
         try {
           const parsed = JSON.parse(String(part.value));
@@ -1668,7 +2137,8 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
     templateCount: templates.length,
     tableCount: tables.length,
     namingPatternProvided: Boolean(String(namingPattern ?? '').trim()),
-    openclawRowFlowResultsProvided: Object.keys(openclawRowFlowResults).length
+    openclawRowFlowResultsProvided: Object.keys(openclawRowFlowResults).length,
+    runAsync
   });
   if (templates.length !== 1) return reply.badRequest('Discord v1 richiede esattamente 1 file template .docx');
   if (tables.length !== 1) return reply.badRequest('Discord v1 richiede esattamente 1 tabella .xlsx o .csv');
@@ -1676,370 +2146,90 @@ app.post('/discord/v1/template-table-autocontinue', async (request, reply) => {
   const template = templates[0];
   const table = tables[0];
 
-  const createPracticeRes = await app.inject({
-    method: 'POST',
-    url: '/practices',
-    payload: { actor, caseType: 'precetto_di', schemaVer: '1.0.0' }
-  });
-  const createPracticeJson = createPracticeRes.json();
-  if (createPracticeRes.statusCode >= 400) return reply.code(createPracticeRes.statusCode).send(createPracticeJson);
-  const practiceId = createPracticeJson.data.id as string;
-  logDiscordV1Debug('practice.created', { practiceId, actor, templateFilename: template.filename, tableFilename: table.filename });
-
-  await app.inject({
-    method: 'POST',
-    url: `/practices/${practiceId}/mode`,
-    payload: { actor, mode: 'DETERMINISTIC_TABLE_FIRST' }
-  });
-
-  const latestTemplate = await prisma.template.findFirst({ where: { name: 'discord-v1-template' }, orderBy: { version: 'desc' } });
-  const createdTemplate = await prisma.template.create({
-    data: {
-      id: crypto.randomUUID(),
-      name: 'discord-v1-template',
-      version: (latestTemplate?.version ?? 0) + 1,
-      filename: template.filename,
-      mimeType: template.mimeType,
-      sizeBytes: template.bytes.length,
-      sha256: sha256(Buffer.from(template.bytes)),
-      content: Buffer.from(template.bytes),
-      isActive: true
-    }
-  });
-  const templateId = createdTemplate.id;
-
-  const selectTemplateRes = await app.inject({
-    method: 'POST',
-    url: `/practices/${practiceId}/select-template`,
-    payload: { templateId, actor }
-  });
-  if (selectTemplateRes.statusCode >= 400) return reply.code(selectTemplateRes.statusCode).send(selectTemplateRes.json());
-
-  const importedRows = await parseImportFileRows(table.filename, table.mimeType, Buffer.from(table.bytes));
-  if (!importedRows.length) return reply.badRequest('Import file has no data rows.');
-  logDiscordV1Debug('ingest.parsed-table', {
-    practiceId,
-    tableFilename: table.filename,
-    importedRows: importedRows.length,
-    importedColumns: summarizeDiscordV1Columns(importedRows as Record<string, unknown>[]),
-    sampleRow: summarizeDiscordV1RowValues((importedRows[0] ?? {}) as Record<string, unknown>)
-  });
-
-  const templateStructure = await buildTemplateTableStructure(Buffer.from(template.bytes));
-  const templateDrivenKeys = templateStructure.headers.filter((key) => key !== 'row_id');
-  const projectImportedRowToTemplate = (row: Record<string, unknown>) => {
-    const normalized = normalizeImportRow(row);
-    return Object.fromEntries(templateDrivenKeys.map((key) => [key, normalized[key] ?? ''])) as Record<string, unknown>;
-  };
-
-  await prisma.tableRow.deleteMany({ where: { practiceId, source: 'import-batch' } });
-  for (let idx = 0; idx < importedRows.length; idx++) {
-    const sourceRow = importedRows[idx] as Record<string, unknown>;
-    const rowIdRaw = sourceRow.row_id;
-    const rowIndex = Number.isFinite(Number(rowIdRaw)) ? Number(rowIdRaw) : idx + 1;
-    const projected = projectImportedRowToTemplate(sourceRow);
-
-    await prisma.tableRow.upsert({
-      where: { practiceId_rowIndex: { practiceId, rowIndex } },
-      create: {
+  if (runAsync) {
+    const job = await prisma.discordAutocontinueJob.create({
+      data: {
         id: crypto.randomUUID(),
-        practiceId,
-        rowIndex,
-        source: 'import-batch',
-        originMode: WorkingMode.DETERMINISTIC_TABLE_FIRST,
-        valuesJson: JSON.stringify(projected),
-        status: RowStatus.READY,
-        reviewState: ReviewState.TODO
-      },
-      update: {
-        source: 'import-batch',
-        originMode: WorkingMode.DETERMINISTIC_TABLE_FIRST,
-        valuesJson: JSON.stringify(projected),
-        status: RowStatus.READY,
-        reviewState: ReviewState.TODO,
-        updatedAt: new Date()
-      }
-    });
-  }
-
-  const activeEntriesCount = await upsertPracticeFieldsFromRow(practiceId, projectImportedRowToTemplate(importedRows[0] as Record<string, unknown>), actor, table.filename);
-  await prisma.storedFile.create({
-    data: {
-      id: crypto.randomUUID(),
-      practiceId,
-      kind: FileKind.PRACTICE_IMPORT,
-      filename: table.filename,
-      mimeType: table.mimeType,
-      sizeBytes: table.bytes.length,
-      sha256: sha256(Buffer.from(table.bytes)),
-      content: Buffer.from(table.bytes)
-    }
-  });
-  await prisma.auditEvent.create({
-    data: {
-      id: crypto.randomUUID(),
-      practiceId,
-      actor,
-      action: 'IMPORT_FILE_APPLIED',
-      payloadJson: JSON.stringify({ filename: table.filename, importedRows: importedRows.length, activeFields: activeEntriesCount, ingestChannel: 'discord-v1' })
-    }
-  });
-  const importJson = { ok: true, data: { filename: table.filename, importedRows: importedRows.length, activeFields: activeEntriesCount, activeRowIndex: 1 } };
-  logDiscordV1Debug('workspace.populated', {
-    practiceId,
-    importedRows: importedRows.length,
-    activeFields: activeEntriesCount,
-    firstRowColumns: templateDrivenKeys.length,
-    templateDrivenColumns: truncateList(templateDrivenKeys, 20)
-  });
-
-  const prepareRes = await app.inject({
-    method: 'POST',
-    url: `/practices/${practiceId}/workflow/prepare`,
-    payload: { actor, mode: 'DETERMINISTIC_TABLE_FIRST', templateId }
-  });
-  const prepareJson = prepareRes.json();
-  logDiscordV1Debug('workflow.prepare.result', {
-    practiceId,
-    statusCode: prepareRes.statusCode,
-    outcome: prepareJson.data?.comparison?.outcome ?? null,
-    hasSpecialPlaceholders: Boolean(prepareJson.data?.hasSpecialPlaceholders),
-    nextAction: prepareJson.data?.nextAction ?? null,
-    warningCodes: (prepareJson.data?.warnings ?? []).map((warning: { code?: string }) => warning.code ?? 'unknown'),
-    comparison: prepareJson.data?.comparison
-      ? {
-          matchedCount: (prepareJson.data.comparison.matched ?? []).length,
-          missingCount: (prepareJson.data.comparison.missing ?? []).length,
-          extraCount: (prepareJson.data.comparison.extra ?? []).length,
-          missingColumns: truncateList(prepareJson.data.comparison.missing ?? []),
-          extraColumns: truncateList(prepareJson.data.comparison.extra ?? [])
-        }
-      : null
-  });
-  if (prepareRes.statusCode >= 400) return reply.code(prepareRes.statusCode).send(prepareJson);
-
-  let enrichData: any = null;
-  if (prepareJson.data?.hasSpecialPlaceholders) {
-    const rowIndexes = Object.keys(openclawRowFlowResults)
-      .map((value) => Number(value))
-      .filter((value) => Number.isFinite(value) && value > 0)
-      .sort((a, b) => a - b);
-
-    if (!rowIndexes.length) {
-      logDiscordV1Debug('workflow.enrich.skipped', {
-        practiceId,
-        reason: 'special-placeholders-present-but-no-openclaw-values',
-        specialPlaceholderKeys: truncateList((prepareJson.data?.specialInstructions ?? []).map((item: { key?: string }) => item.key ?? '').filter(Boolean))
-      });
-    } else {
-      const derivedKeys = new Set<string>();
-      const generatedKeys = new Set<string>();
-      for (const rowIndex of rowIndexes) {
-        const rowPayload = openclawRowFlowResults[String(rowIndex)] ?? {};
-        const deriveValues = normalizeImportRow((rowPayload.deriveValues ?? {}) as Record<string, unknown>);
-        const generateValues = normalizeImportRow((rowPayload.generateValues ?? {}) as Record<string, unknown>);
-        if (!Object.keys(deriveValues).length && !Object.keys(generateValues).length) continue;
-
-        logDiscordV1Debug('workflow.enrich.started', {
-          practiceId,
-          rowIndex,
-          deriveCount: Object.keys(deriveValues).length,
-          generateCount: Object.keys(generateValues).length,
-          specialPlaceholderKeys: truncateList((prepareJson.data?.specialInstructions ?? []).map((item: { key?: string }) => item.key ?? '').filter(Boolean))
-        });
-        const enrichRes = await app.inject({
-          method: 'POST',
-          url: `/practices/${practiceId}/workflow/enrich`,
-          payload: { actor, templateId, rowIndex, deriveValues, generateValues }
-        });
-        const enrichJson = enrichRes.json();
-        if (enrichRes.statusCode >= 400) return reply.code(enrichRes.statusCode).send(enrichJson);
-
-        for (const key of Object.keys(deriveValues)) derivedKeys.add(key);
-        for (const key of Object.keys(generateValues)) generatedKeys.add(key);
-      }
-
-      enrichData = {
-        executed: true,
-        rowCount: rowIndexes.length,
-        derivedKeys: Array.from(derivedKeys),
-        generatedKeys: Array.from(generatedKeys),
-        warnings: []
-      };
-      logDiscordV1Debug('workflow.enrich.result', {
-        practiceId,
-        rowCount: rowIndexes.length,
-        derivedKeys: Array.from(derivedKeys),
-        generatedKeys: Array.from(generatedKeys),
-        warningCodes: []
-      });
-    }
-  } else {
-    logDiscordV1Debug('workflow.enrich.skipped', {
-      practiceId,
-      reason: 'no-special-placeholders'
-    });
-  }
-
-  const rowsRes = await app.inject({ method: 'GET', url: `/practices/${practiceId}/table-rows` });
-  const rowsJson = rowsRes.json();
-  if (rowsRes.statusCode >= 400) return reply.code(rowsRes.statusCode).send(rowsJson);
-  const rows = rowsJson.data ?? [];
-  logDiscordV1Debug('table.rows.ready', {
-    practiceId,
-    rowCount: rows.length,
-    columns: summarizeDiscordV1Columns(rows.map((row: { values?: Record<string, unknown> }) => (row.values ?? {}) as Record<string, unknown>)),
-    sampleRow: summarizeDiscordV1RowValues((rows[0]?.values ?? {}) as Record<string, unknown>)
-  });
-  logDiscordV1Debug('naming.rule.selected', {
-    practiceId,
-    namingMode: String(namingPattern ?? '').trim() ? 'custom-pattern' : 'fallback-standard',
-    namingPattern: String(namingPattern ?? '').trim() || null,
-    fallbackPatternExample: `doc-generator_${practiceId}_row_001.docx`
-  });
-
-  const generatedDocs: Array<{ filename: string; bytes: Uint8Array }> = [];
-  const generationRows: Array<{ rowIndex: number; rowId?: string; filename?: string; status: 'generated' | 'error'; missingFields: number; warnings: string[]; missingFieldKeys?: string[]; error?: string }> = [];
-  const templateFieldKeys = await extractTemplateFields(template.bytes);
-
-  for (const row of rows) {
-    const rowIndex = Number(row.rowIndex ?? 0);
-    const rowValues = (row.values ?? {}) as Record<string, unknown>;
-    const rowId = String(rowValues.row_id ?? '').trim() || undefined;
-    const genRes = await app.inject({
-      method: 'POST',
-      url: `/practices/${practiceId}/generate-docx-from-row`,
-      payload: { actor, rowIndex, templateId }
-    });
-
-    if (genRes.statusCode >= 400) {
-      const error = genRes.json().error ?? `HTTP ${genRes.statusCode}`;
-      logDiscordV1Debug('generation.row.error', {
-        practiceId,
-        rowIndex,
-        rowId: rowId ?? null,
-        statusCode: genRes.statusCode,
-        error
-      });
-      generationRows.push({
-        rowIndex,
-        rowId,
-        status: 'error',
-        missingFields: 0,
-        warnings: [],
-        error
-      });
-      continue;
-    }
-
-    const contentDisposition = String(genRes.headers['content-disposition'] ?? '');
-    const generatedFilename = contentDisposition.match(/filename="([^"]+)"/)?.[1] ?? `row_${rowIndex}.docx`;
-    const missingFields = Number(genRes.headers['x-rca-missing-fields'] ?? '0');
-    const missingFieldKeys = templateFieldKeys.filter((key) => emptyValue(rowValues[key]));
-    const filename = resolveDiscordV1OutputFilename({
-      templateFilename: generatedFilename,
-      rowIndex,
-      rowValues,
-      namingPattern,
-      practiceId,
-      fallbackPrefix: 'doc-generator'
-    });
-    const bytes = new Uint8Array(genRes.rawPayload);
-    logDiscordV1Debug('generation.row.completed', {
-      practiceId,
-      rowIndex,
-      rowId: rowId ?? null,
-      sourceFilename: generatedFilename,
-      assignedFilename: filename,
-      missingFields: Number.isFinite(missingFields) ? missingFields : 0,
-      missingFieldKeys: truncateList(missingFieldKeys),
-      rowValuePreview: summarizeDiscordV1RowValues(rowValues)
-    });
-    generatedDocs.push({ filename, bytes });
-    generationRows.push({
-      rowIndex,
-      rowId,
-      filename,
-      status: 'generated',
-      missingFields: Number.isFinite(missingFields) ? missingFields : 0,
-      missingFieldKeys,
-      warnings: missingFields > 0 ? [`${missingFields} placeholder template lasciati vuoti o incompleti`] : []
-    });
-  }
-
-  const generatedPdfs = [] as Array<{ filename: string; bytes: Uint8Array }>;
-  for (const doc of generatedDocs) {
-    generatedPdfs.push(await convertDocxBytesToPdf({ filename: doc.filename, bytes: doc.bytes }));
-  }
-
-  const reportMarkdown = buildDiscordV1ReportMarkdown({
-    practiceId,
-    templateFilename: template.filename,
-    tableFilename: table.filename,
-    namingPattern,
-    firstPhase: prepareJson.data,
-    secondPhase: enrichData,
-    generationRows
-  });
-  const summaryCsv = buildDiscordV1SummaryCsv(generationRows);
-  const zipBytes = await buildDiscordV1Zip({ generatedDocs, generatedPdfs, reportMarkdown, summaryCsv });
-  const finalSummary = buildDiscordV1FinalSummary(generationRows, Boolean(enrichData));
-  const zipFilename = `discord_v1_${practiceId}.zip`;
-  const persistedDownload = await persistDiscordDownloadBatch({
-    practiceId,
-    zipFilename,
-    zipBytes,
-    actor
-  });
-  const publicBaseUrl = buildPublicBaseUrl(request.headers as Record<string, unknown>);
-  const downloadUrl = buildDiscordDownloadUrl(publicBaseUrl, persistedDownload.token);
-  logDiscordV1Debug('generation.completed', {
-    practiceId,
-    generatedDocs: generatedDocs.length,
-    zipBytes: zipBytes.length,
-    zipStoredAt: persistedDownload.absolutePath,
-    downloadUrl,
-    finalSummary
-  });
-
-  await prisma.auditEvent.create({
-    data: {
-      id: crypto.randomUUID(),
-      practiceId,
-      actor,
-      action: 'DISCORD_V1_AUTOCONTINUE_COMPLETED',
-      payloadJson: JSON.stringify({
-        templateFilename: template.filename,
-        tableFilename: table.filename,
+        status: 'QUEUED',
+        actor,
         namingPattern: namingPattern || null,
-        importedRows: importJson.data?.importedRows ?? rows.length,
-        zipFilename,
-        zipRelativePath: persistedDownload.batch.zipRelativePath,
-        retainedUntil: persistedDownload.retainedUntil,
-        tokenExpiresAt: persistedDownload.tokenExpiresAt,
-        finalSummary
-      })
-    }
-  });
+        openclawRowFlowResultsJson: Object.keys(openclawRowFlowResults).length ? JSON.stringify(openclawRowFlowResults) : null,
+        templateFilename: template.filename,
+        templateMimeType: template.mimeType,
+        templateBytes: Buffer.from(template.bytes),
+        tableFilename: table.filename,
+        tableMimeType: table.mimeType,
+        tableBytes: Buffer.from(table.bytes)
+      }
+    });
+    scheduleDiscordAutocontinueJob(job.id);
+    const statusUrl = `/discord/v1/template-table-autocontinue/jobs/${job.id}`;
+    reply.code(202);
+    reply.header('x-rca-discord-job-id', job.id);
+    reply.header('x-rca-discord-job-status-url', statusUrl);
+    reply.header('x-rca-discord-initial-message', 'Lavorazione Discord v1 accodata: template + tabella ricevuti, elaborazione batch in background avviata.');
+    return {
+      ok: true,
+      data: {
+        jobId: job.id,
+        status: job.status,
+        statusUrl,
+        acceptedAt: job.createdAt.toISOString()
+      }
+    };
+  }
 
-  reply.header('x-rca-discord-practice-id', practiceId);
-  reply.header('x-rca-discord-summary', JSON.stringify(finalSummary));
-  reply.header('x-rca-discord-download-url', downloadUrl);
-  reply.header('x-rca-discord-initial-message', 'Lavorazione Discord v1 avviata: template + tabella ricevuti, auto-continue attivo.');
-  reply.header('x-rca-discord-final-message', `Esito Discord v1: ${finalSummary.generatedCount}/${finalSummary.totalRows} documenti generati, ${finalSummary.warningRows} righe con warning, ${finalSummary.errorRows} righe con errori.`);
+  try {
+    const result = await executeDiscordV1Autocontinue({
+      actor,
+      namingPattern,
+      openclawRowFlowResults,
+      template,
+      table,
+      requestHeaders: request.headers as Record<string, unknown>
+    });
+    reply.header('x-rca-discord-practice-id', result.practiceId);
+    reply.header('x-rca-discord-summary', JSON.stringify(result.finalSummary));
+    reply.header('x-rca-discord-download-url', result.download.url);
+    reply.header('x-rca-discord-initial-message', result.initialMessage);
+    reply.header('x-rca-discord-final-message', result.finalMessage);
+    return { ok: true, data: result };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return reply.code(400).send({ ok: false, error: message });
+  }
+});
+
+app.get('/discord/v1/template-table-autocontinue/jobs/:jobId', async (request, reply) => {
+  const { jobId } = request.params as { jobId: string };
+  const job = await prisma.discordAutocontinueJob.findUnique({ where: { id: jobId } });
+  if (!job) return reply.notFound('Job non trovato.');
+
+  let finalSummary: Record<string, unknown> | null = null;
+  if (job.finalSummaryJson) {
+    try { finalSummary = JSON.parse(job.finalSummaryJson) as Record<string, unknown>; } catch {}
+  }
+
   return {
     ok: true,
     data: {
-      practiceId,
+      jobId: job.id,
+      status: job.status,
+      actor: job.actor,
+      practiceId: job.practiceId,
+      acceptedAt: job.createdAt.toISOString(),
+      startedAt: job.startedAt?.toISOString() ?? null,
+      completedAt: job.completedAt?.toISOString() ?? null,
+      error: job.errorMessage,
       finalSummary,
-      download: {
-        url: downloadUrl,
-        expiresAt: persistedDownload.tokenExpiresAt.toISOString(),
-        maxDownloads: persistedDownload.batch.tokenMaxDownloads,
-        retainedUntil: persistedDownload.retainedUntil.toISOString(),
-        filename: zipFilename,
-        storagePath: persistedDownload.batch.zipRelativePath
-      }
+      download: job.downloadUrl
+        ? {
+            url: job.downloadUrl,
+            expiresAt: job.downloadExpiresAt?.toISOString() ?? null,
+            maxDownloads: job.downloadMaxDownloads,
+            retainedUntil: job.downloadRetainedUntil?.toISOString() ?? null
+          }
+        : null
     }
   };
 });
@@ -2354,6 +2544,8 @@ app.get('/practices/:id/summary', async (request, reply) => {
 
 
 
+
+await resumePendingDiscordAutocontinueJobs();
 
 const port = Number(process.env.PORT ?? 8787);
 app.listen({ port, host: '0.0.0.0' })

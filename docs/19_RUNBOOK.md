@@ -59,6 +59,8 @@ Smoke tabella deterministic-first:
 
 ## Discord v1 — template + tabella in auto-continue
 - endpoint: `POST /discord/v1/template-table-autocontinue`
+- async mode: same endpoint with multipart field `async=true` returns `202` + `jobId` + status URL `GET /discord/v1/template-table-autocontinue/jobs/:jobId`
+- canonical Discord processor now enqueues background work, then polls short status requests until completion instead of holding one long HTTP request open
 - input multipart richiesto:
   - `actor` opzionale
   - **1 file `.docx`**
