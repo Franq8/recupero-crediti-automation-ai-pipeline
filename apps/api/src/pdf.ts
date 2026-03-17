@@ -97,6 +97,7 @@ async function convertWithWord(input: { filename: string; bytes: Uint8Array }): 
     'set outputPosix to item 2 of argv',
     'set inputFile to POSIX file inputPosix',
     'set outputFile to POSIX file outputPosix',
+    'with timeout of 1800 seconds',
     'tell application "Microsoft Word"',
     'activate',
     'set display alerts to alerts none',
@@ -104,6 +105,7 @@ async function convertWithWord(input: { filename: string; bytes: Uint8Array }): 
     'save as sourceDoc file name outputFile file format format PDF',
     'close sourceDoc saving no',
     'end tell',
+    'end timeout',
     'end run'
   ];
 
