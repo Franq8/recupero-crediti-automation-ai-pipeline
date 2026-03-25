@@ -90,8 +90,8 @@ function normalizeObjectRow(value: unknown): Record<string, unknown> {
 function normalizeExcelValue(v: ExcelJS.CellValue): unknown {
   if (v === null || v === undefined) return '';
   if (typeof v === 'object') {
-    if ('text' in v && typeof v.text === 'string') return v.text.trim();
     if ('result' in v) return (v as any).result ?? '';
+    if ('text' in v && typeof v.text === 'string') return v.text.trim();
     return String((v as any).toString?.() ?? '').trim();
   }
   return typeof v === 'string' ? v.trim() : v;
@@ -124,7 +124,7 @@ function formatExcelDate(value: Date, numFmt: string) {
 
 function formatExcelNumber(value: number, numFmt: string) {
   const rawFmt = String(numFmt || '');
-  const hasItalianLocaleHint = /(it-it|it\)|\[$[^\]]*€[^\]]*\]|\beuro\b|\b€\b)/i.test(rawFmt);
+  const hasItalianLocaleHint = /(it-it|it\)|\beuro\b|€)/i.test(rawFmt);
   const normalizedFmt = rawFmt.replace(/\[[^\]]+\]/g, '').replace(/"[^"]*"/g, '').trim();
   const decimalSection = normalizedFmt.split(';')[0] || normalizedFmt;
   const numericCore = (decimalSection.match(/[0#.,]+/) || [''])[0];
