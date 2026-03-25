@@ -31,42 +31,10 @@ function normalizeValue(value: unknown): string {
   return String(value);
 }
 
-function normalizeEuropeanCurrencyString(input: string): string {
-  const raw = String(input ?? '');
-  const trimmed = raw.trim();
-  if (!trimmed) return raw;
-
-  const sign = trimmed.startsWith('-') ? '-' : '';
-  const unsigned = sign ? trimmed.slice(1) : trimmed;
-  const compact = unsigned.replace(/\s+/g, '');
-  const numericLike = compact.replace(/[€$£]/g, '');
-  if (!/^\d{1,3}([.,]\d{3})*([.,]\d+)?$|^\d+([.,]\d+)?$/.test(numericLike)) return raw;
-
-  const lastComma = numericLike.lastIndexOf(',');
-  const lastDot = numericLike.lastIndexOf('.');
-  const decimalSep = lastComma > lastDot ? ',' : lastDot > lastComma ? '.' : '';
-  const decimalIndex = decimalSep ? numericLike.lastIndexOf(decimalSep) : -1;
-  const decimalDigits = decimalIndex >= 0 ? numericLike.slice(decimalIndex + 1).replace(/[^0-9]/g, '') : '';
-  const integerDigits = (decimalIndex >= 0 ? numericLike.slice(0, decimalIndex) : numericLike).replace(/[^0-9]/g, '');
-  if (!integerDigits) return raw;
-
-  const groupedInteger = integerDigits.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
-  return `${sign}${groupedInteger}${decimalDigits ? `,${decimalDigits}` : ''}`;
-}
-
-function isCurrencyLikeFieldKey(key: string): boolean {
-  const normalized = String(key ?? '').toLowerCase();
-  return /(totale|importo|spese|saldo|prezzo|costo|valore|ammontare|euro|eur|pagamento|dovuto|maggiorato)/.test(normalized);
-}
-
 function resolveTemplateReplacementValue(key: string, value: unknown) {
   if (typeof value === 'string') {
     if (value === '') return key;
     if (value === 'null') return '';
-    if (isCurrencyLikeFieldKey(key)) return normalizeEuropeanCurrencyString(value);
-  }
-  if (typeof value === 'number' && isCurrencyLikeFieldKey(key)) {
-    return normalizeEuropeanCurrencyString(String(value));
   }
   return normalizeValue(value);
 }

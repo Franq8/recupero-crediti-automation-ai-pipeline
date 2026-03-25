@@ -189,10 +189,27 @@ function formatExcelDisplayedValue(cell: ExcelJS.Cell): string | null {
   return null;
 }
 
+function normalizeAmericanNumberStringToEuropean(input: string): string {
+  const raw = String(input ?? '');
+  const trimmed = raw.trim();
+  if (!trimmed) return raw;
+  if (!/^[-+]?\d{1,3}(,\d{3})+(\.\d+)?$|^[-+]?\d+\.\d+$/.test(trimmed)) return raw;
+
+  const sign = trimmed.startsWith('-') || trimmed.startsWith('+') ? trimmed[0] : '';
+  const unsigned = sign ? trimmed.slice(1) : trimmed;
+  const lastDot = unsigned.lastIndexOf('.');
+  const decimalDigits = lastDot >= 0 ? unsigned.slice(lastDot + 1).replace(/[^0-9]/g, '') : '';
+  const integerDigits = (lastDot >= 0 ? unsigned.slice(0, lastDot) : unsigned).replace(/[^0-9]/g, '');
+  if (!integerDigits) return raw;
+  const groupedInteger = integerDigits.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  return `${sign}${groupedInteger}${decimalDigits ? `,${decimalDigits}` : ''}`;
+}
+
 function normalizeExcelCell(cell: ExcelJS.Cell): unknown {
   const rawValue = normalizeExcelValue(cell.value);
   const formattedValue = formatExcelDisplayedValue(cell);
   if (formattedValue !== null) return formattedValue;
+  if (typeof rawValue === 'string') return normalizeAmericanNumberStringToEuropean(rawValue);
   return rawValue;
 }
 
