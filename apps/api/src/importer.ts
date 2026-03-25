@@ -123,25 +123,39 @@ function formatExcelDate(value: Date, numFmt: string) {
 }
 
 function formatExcelNumber(value: number, numFmt: string) {
-  const normalizedFmt = numFmt.replace(/\[[^\]]+\]/g, '').replace(/"[^"]*"/g, '');
-  const lastComma = normalizedFmt.lastIndexOf(',');
-  const lastDot = normalizedFmt.lastIndexOf('.');
-  const decimalSepIndex = Math.max(lastComma, lastDot);
+  const normalizedFmt = numFmt.replace(/\[[^\]]+\]/g, '').replace(/"[^"]*"/g, '').trim();
+  const decimalSection = normalizedFmt.split(';')[0] || normalizedFmt;
+  const numericCore = (decimalSection.match(/[0#.,]+/) || [''])[0];
+  const lastComma = numericCore.lastIndexOf(',');
+  const lastDot = numericCore.lastIndexOf('.');
+  const decimalSep = lastComma > lastDot ? ',' : lastDot > lastComma ? '.' : '';
+  const decimalSepIndex = decimalSep ? numericCore.lastIndexOf(decimalSep) : -1;
   const decimals = decimalSepIndex >= 0
-    ? (normalizedFmt.slice(decimalSepIndex + 1).match(/[0#]/g) || []).length
+    ? (numericCore.slice(decimalSepIndex + 1).match(/[0#]/g) || []).length
     : 0;
-  const useItalianStyle = normalizedFmt.includes('#.##') || /0,0|#,##0,00/.test(normalizedFmt) || normalizedFmt.includes('€.');
-  if (useItalianStyle) {
+  const integerPartPattern = decimalSepIndex > 0 ? numericCore.slice(0, decimalSepIndex) : numericCore;
+  const useGrouping = /[.,](?=.*[0#])/.test(integerPartPattern);
+
+  if (decimalSep === ',') {
     return new Intl.NumberFormat('it-IT', {
       minimumFractionDigits: decimals,
       maximumFractionDigits: decimals,
-      useGrouping: true
+      useGrouping
     }).format(value);
   }
+
+  if (decimalSep === '.') {
+    return new Intl.NumberFormat('en-US', {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+      useGrouping
+    }).format(value);
+  }
+
   return new Intl.NumberFormat('en-US', {
-    minimumFractionDigits: decimals,
-    maximumFractionDigits: decimals,
-    useGrouping: /#,##|,##0/.test(numFmt)
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 0,
+    useGrouping
   }).format(value);
 }
 

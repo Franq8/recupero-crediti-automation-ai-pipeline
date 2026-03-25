@@ -59,10 +59,11 @@ test('parseImportFileRows on csv auto-detects semicolon delimiters', async () =>
 test('parseImportFileRows on xlsx preserves displayed number and date formats', async () => {
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Formato');
-  ws.addRow(['importo', 'data', 'testo']);
-  const row = ws.addRow([3948.94, new Date('2026-03-16T00:00:00Z'), 'ABC']);
+  ws.addRow(['importo', 'data', 'testo', 'importo_en']);
+  const row = ws.addRow([3948.94, new Date('2026-03-16T00:00:00Z'), 'ABC', 3661.05]);
   row.getCell(1).numFmt = '#.##0,00';
   row.getCell(2).numFmt = 'dd/mm/yyyy';
+  row.getCell(4).numFmt = '#,##0.00';
 
   const data = await wb.xlsx.writeBuffer();
   const rows = await parseImportFileRows(
@@ -71,7 +72,7 @@ test('parseImportFileRows on xlsx preserves displayed number and date formats', 
     Buffer.from(data as ArrayBuffer)
   );
 
-  assert.deepEqual(rows, [{ importo: '3.948,94', data: '16/03/2026', testo: 'ABC' }]);
+  assert.deepEqual(rows, [{ importo: '3.948,94', data: '16/03/2026', testo: 'ABC', importo_en: '3,661.05' }]);
 });
 
 test('extractSpreadsheetDocumentText on xlsx includes all sheets as document content', async () => {
