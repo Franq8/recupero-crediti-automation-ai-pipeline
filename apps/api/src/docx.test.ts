@@ -57,3 +57,15 @@ test('renderDocxTemplate removes placeholder text when source value is literal n
   assert.match(xml, /<w:t><\/w:t>/);
   assert.doesNotMatch(xml, /campo/);
 });
+
+test('renderDocxTemplate normalizes only currency-like fields to european format', async () => {
+  const zip = new JSZip();
+  zip.file('word/document.xml', '<w:document><w:body><w:p><w:r><w:t>{Totale_dovuto}</w:t></w:r><w:r><w:t>{N_SOCIO}</w:t></w:r></w:p></w:body></w:document>');
+  const buf = await zip.generateAsync({ type: 'uint8array' });
+  const out = await renderDocxTemplate(buf, { Totale_dovuto: '9,106.45', N_SOCIO: '26,293' });
+  const zipOut = await JSZip.loadAsync(out);
+  const xml = await zipOut.file('word/document.xml')!.async('text');
+
+  assert.match(xml, /<w:t>9\.106,45<\/w:t>/);
+  assert.match(xml, /<w:t>26,293<\/w:t>/);
+});
