@@ -123,13 +123,23 @@ function formatExcelDate(value: Date, numFmt: string) {
 }
 
 function formatExcelNumber(value: number, numFmt: string) {
-  const normalizedFmt = numFmt.replace(/\[[^\]]+\]/g, '').replace(/"[^"]*"/g, '').trim();
+  const rawFmt = String(numFmt || '');
+  const hasItalianLocaleHint = /(it-it|it\)|\[$[^\]]*€[^\]]*\]|\beuro\b|\b€\b)/i.test(rawFmt);
+  const normalizedFmt = rawFmt.replace(/\[[^\]]+\]/g, '').replace(/"[^"]*"/g, '').trim();
   const decimalSection = normalizedFmt.split(';')[0] || normalizedFmt;
   const numericCore = (decimalSection.match(/[0#.,]+/) || [''])[0];
   const lastComma = numericCore.lastIndexOf(',');
   const lastDot = numericCore.lastIndexOf('.');
-  const decimalSep = lastComma > lastDot ? ',' : lastDot > lastComma ? '.' : '';
-  const decimalSepIndex = decimalSep ? numericCore.lastIndexOf(decimalSep) : -1;
+  const decimalSep = hasItalianLocaleHint
+    ? ','
+    : lastComma > lastDot
+      ? ','
+      : lastDot > lastComma
+        ? '.'
+        : '';
+  const decimalSepIndex = decimalSep
+    ? (decimalSep === ',' && hasItalianLocaleHint && lastDot > lastComma ? lastDot : numericCore.lastIndexOf(decimalSep))
+    : -1;
   const decimals = decimalSepIndex >= 0
     ? (numericCore.slice(decimalSepIndex + 1).match(/[0#]/g) || []).length
     : 0;
@@ -152,7 +162,7 @@ function formatExcelNumber(value: number, numFmt: string) {
     }).format(value);
   }
 
-  return new Intl.NumberFormat('en-US', {
+  return new Intl.NumberFormat(hasItalianLocaleHint ? 'it-IT' : 'en-US', {
     minimumFractionDigits: 0,
     maximumFractionDigits: 0,
     useGrouping
