@@ -31,6 +31,14 @@ function normalizeValue(value: unknown): string {
   return String(value);
 }
 
+function resolveTemplateReplacementValue(key: string, value: unknown) {
+  if (typeof value === 'string') {
+    if (value === '') return key;
+    if (value === 'null') return '';
+  }
+  return normalizeValue(value);
+}
+
 function isWordArtifactKey(key: string) {
   const trimmed = String(key || '').trim();
   if (!trimmed) return true;
@@ -240,7 +248,7 @@ export async function renderDocxTemplate(
   const zip = await JSZip.loadAsync(docxBytes);
 
   const replacements = Object.fromEntries(
-    Object.entries(fieldMap).map(([k, v]) => [k, xmlEscape(normalizeValue(v))])
+    Object.entries(fieldMap).map(([k, v]) => [k, xmlEscape(resolveTemplateReplacementValue(k, v))])
   );
 
   for (const fileName of XML_TARGETS) {
