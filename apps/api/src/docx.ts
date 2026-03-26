@@ -64,6 +64,7 @@ type ParagraphTextNode = {
   textStart: number;
   textEnd: number;
   text: string;
+  attrs: string;
 };
 
 function replaceMustacheAndChevrons(xml: string, replacements: Record<string, string>) {
@@ -92,7 +93,7 @@ function replaceCanonicalPlaceholdersInParagraphRuns(
     const openTag = `<w:t${attrs}>`;
     const textStart = start + openTag.length;
     const textEnd = textStart + text.length;
-    nodes.push({ start, end: start + full.length, textStart, textEnd, text });
+    nodes.push({ start, end: start + full.length, textStart, textEnd, text, attrs });
     pieces.push(text);
   }
 
@@ -151,7 +152,11 @@ function replaceCanonicalPlaceholdersInParagraphRuns(
   let out = paragraphXml;
   for (let i = nodes.length - 1; i >= 0; i -= 1) {
     const node = nodes[i];
-    out = `${out.slice(0, node.textStart)}${replacementsByNode[i]}${out.slice(node.textEnd)}`;
+    const needsPreserve = /^\s|\s$/.test(replacementsByNode[i]);
+    const cleanedAttrs = node.attrs.replace(/\s+xml:space="preserve"/g, '');
+    const attrs = needsPreserve ? `${cleanedAttrs} xml:space="preserve"` : cleanedAttrs;
+    const replacementNode = `<w:t${attrs}>${replacementsByNode[i]}</w:t>`;
+    out = `${out.slice(0, node.start)}${replacementNode}${out.slice(node.end)}`;
   }
 
   return out;
