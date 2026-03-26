@@ -24,6 +24,11 @@ function xmlEscape(input: string) {
     .replace(/'/g, '&apos;');
 }
 
+function wrapWordText(value: string) {
+  const needsPreserve = /^\s|\s$/.test(value);
+  return `<w:t${needsPreserve ? ' xml:space="preserve"' : ''}>${value}</w:t>`;
+}
+
 function normalizeValue(value: unknown): string {
   if (value === null || value === undefined) return '';
   if (typeof value === 'number') return String(value);
@@ -170,7 +175,7 @@ function replaceFldSimple(xml: string, replacements: Record<string, string>) {
     if (!field || !(field in replacements)) return full;
 
     const val = replacements[field];
-    const patchedInner = inner.replace(/<w:t[^>]*>[\s\S]*?<\/w:t>/, `<w:t>${val}</w:t>`);
+    const patchedInner = inner.replace(/<w:t[^>]*>[\s\S]*?<\/w:t>/, wrapWordText(val));
     return `<w:fldSimple${attrs}>${patchedInner}</w:fldSimple>`;
   });
 }
@@ -194,7 +199,7 @@ function replaceComplexFieldRuns(xml: string, replacements: Record<string, strin
         (...args) => {
           const sepA = args[1] ?? args[4];
           const endA = args[3] ?? args[6];
-          return `${sepA}<w:r><w:t>${val}</w:t></w:r>${endA}`;
+          return `${sepA}<w:r>${wrapWordText(val)}</w:r>${endA}`;
         }
       );
     }
