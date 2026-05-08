@@ -1,4 +1,5 @@
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 
 export type SpreadsheetImportMode = 'first-sheet-only' | 'all-sheets';
 
@@ -22,8 +23,7 @@ export async function parseImportFileRows(
   }
 
   if (lower.endsWith('.xlsx') || mimeType.includes('spreadsheetml')) {
-    const wb = new ExcelJS.Workbook();
-    await wb.xlsx.load(buf as any);
+    const wb = await loadXlsxWorkbook(buf);
 
     const spreadsheetMode = options.spreadsheetMode ?? 'first-sheet-only';
     const worksheets = spreadsheetMode === 'all-sheets' ? wb.worksheets : wb.worksheets.slice(0, 1);
@@ -54,8 +54,7 @@ export async function extractSpreadsheetDocumentText(filename: string, mimeType:
   }
 
   if (lower.endsWith('.xlsx') || mimeType.includes('spreadsheetml')) {
-    const wb = new ExcelJS.Workbook();
-    await wb.xlsx.load(buf as any);
+    const wb = await loadXlsxWorkbook(buf);
 
     const sheetBlocks = wb.worksheets
       .map((ws) => {
@@ -75,6 +74,51 @@ export async function extractSpreadsheetDocumentText(filename: string, mimeType:
   }
 
   return null;
+}
+
+async function loadXlsxWorkbook(buf: Buffer): Promise<ExcelJS.Workbook> {
+  const wb = new ExcelJS.Workbook();
+  try {
+    await wb.xlsx.load(buf as any);
+    return wb;
+  } catch (error) {
+    const normalized = await normalizeSpreadsheetMainNamespacePrefixes(buf);
+    if (!normalized) throw error;
+
+    const retry = new ExcelJS.Workbook();
+    await retry.xlsx.load(normalized as any);
+    return retry;
+  }
+}
+
+async function normalizeSpreadsheetMainNamespacePrefixes(buf: Buffer): Promise<Buffer | null> {
+  const zip = await JSZip.loadAsync(buf);
+  let changed = false;
+
+  for (const [name, entry] of Object.entries(zip.files)) {
+    if (entry.dir || !name.startsWith('xl/')) continue;
+
+    const xml = await entry.async('string');
+    let next = xml;
+
+    if (name.endsWith('.xml') && /xmlns:x=["']http:\/\/schemas\.openxmlformats\.org\/spreadsheetml\/2006\/main["']/.test(next)) {
+      next = next
+        .replace(/xmlns:x=/g, 'xmlns=')
+        .replace(/(<\/?)(x):/g, '$1');
+    }
+
+    if (name.match(/^xl\/worksheets\/_rels\/sheet\d+[.]xml[.]rels$/)) {
+      next = next.replace(/Target=(['"])\/xl\/tables\//g, 'Target=$1../tables/');
+    }
+
+    if (next !== xml) {
+      zip.file(name, next);
+      changed = true;
+    }
+  }
+
+  if (!changed) return null;
+  return zip.generateAsync({ type: 'nodebuffer' });
 }
 
 function normalizeObjectRow(value: unknown): Record<string, unknown> {
@@ -110,7 +154,7 @@ function formatExcelDate(value: Date, numFmt: string) {
   const minute = pad2(value.getMinutes());
   const second = pad2(value.getSeconds());
 
-  let out = numFmt;
+  let out = numFmt.replace(/\[\$-[^\]]+\]/gi, '').replace(/\\/g, '');
   out = out.replace(/yyyy/gi, year4);
   out = out.replace(/yy/gi, year2);
   out = out.replace(/dd/gi, day);
