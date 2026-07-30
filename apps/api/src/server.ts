@@ -357,7 +357,7 @@ async function executeDiscordV1Autocontinue(input: DiscordAutocontinueExecutionI
     const genRes = await app.inject({
       method: 'POST',
       url: `/practices/${practiceId}/generate-docx-from-row`,
-      payload: { actor, rowIndex, templateId }
+      payload: { actor, rowIndex, templateId, removeEmptyPlaceholders: true }
     });
 
     if (genRes.statusCode >= 400) {
@@ -1985,7 +1985,7 @@ app.post('/practices/:id/workflow/enrich', async (request, reply) => {
 
 app.post('/practices/:id/generate-docx-from-row', async (request, reply) => {
   const { id } = request.params as { id: string };
-  const body = (request.body ?? {}) as { rowIndex?: number; actor?: string; templateId?: string };
+  const body = (request.body ?? {}) as { rowIndex?: number; actor?: string; templateId?: string; removeEmptyPlaceholders?: boolean };
 
   const practice = await prisma.practice.findUnique({ where: { id } });
   if (!practice) return reply.notFound('Practice not found');
@@ -2002,7 +2002,7 @@ app.post('/practices/:id/generate-docx-from-row', async (request, reply) => {
   const values = JSON.parse(row.valuesJson) as Record<string, unknown>;
   const templateFields = await extractTemplateFields(tpl.content);
   const missing = templateFields.filter((k) => emptyValue(values[k]));
-  const out = await renderDocxTemplate(tpl.content, values);
+  const out = await renderDocxTemplate(tpl.content, values, { removeEmptyPlaceholders: body.removeEmptyPlaceholders === true });
 
   await prisma.tableRow.update({
     where: { practiceId_rowIndex: { practiceId: id, rowIndex } },

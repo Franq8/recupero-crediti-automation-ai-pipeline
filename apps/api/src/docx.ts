@@ -36,9 +36,9 @@ function normalizeValue(value: unknown): string {
   return String(value);
 }
 
-function resolveTemplateReplacementValue(key: string, value: unknown) {
+function resolveTemplateReplacementValue(key: string, value: unknown, removeEmptyPlaceholders: boolean) {
   if (typeof value === 'string') {
-    if (value === '') return key;
+    if (value === '') return removeEmptyPlaceholders ? '' : key;
     if (value === 'null') return '';
   }
   return normalizeValue(value);
@@ -253,12 +253,13 @@ export async function extractTemplateFields(docxBytes: Uint8Array): Promise<stri
 
 export async function renderDocxTemplate(
   docxBytes: Uint8Array,
-  fieldMap: Record<string, unknown>
+  fieldMap: Record<string, unknown>,
+  options: { removeEmptyPlaceholders?: boolean } = {}
 ): Promise<Uint8Array> {
   const zip = await JSZip.loadAsync(docxBytes);
 
   const replacements = Object.fromEntries(
-    Object.entries(fieldMap).map(([k, v]) => [k, xmlEscape(resolveTemplateReplacementValue(k, v))])
+    Object.entries(fieldMap).map(([k, v]) => [k, xmlEscape(resolveTemplateReplacementValue(k, v, options.removeEmptyPlaceholders === true))])
   );
 
   for (const fileName of XML_TARGETS) {

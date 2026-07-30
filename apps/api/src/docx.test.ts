@@ -46,6 +46,17 @@ test('renderDocxTemplate leaves placeholder text when source value is empty stri
   assert.match(xml, /<w:t>campo<\/w:t>/);
 });
 
+test('renderDocxTemplate removes placeholder text when requested for an empty string', async () => {
+  const zip = new JSZip();
+  zip.file('word/document.xml', '<w:document><w:body><w:p><w:r><w:t>Valore: {campo}.</w:t></w:r></w:p></w:body></w:document>');
+  const buf = await zip.generateAsync({ type: 'uint8array' });
+  const out = await renderDocxTemplate(buf, { campo: '' }, { removeEmptyPlaceholders: true });
+  const zipOut = await JSZip.loadAsync(out);
+  const xml = await zipOut.file('word/document.xml')!.async('text');
+  assert.match(xml, /<w:t>Valore: \.<\/w:t>/);
+  assert.doesNotMatch(xml, /campo/);
+});
+
 test('renderDocxTemplate removes placeholder text when source value is literal null string', async () => {
   const zip = new JSZip();
   zip.file('word/document.xml', '<w:document><w:body><w:p><w:r><w:t>{campo}</w:t></w:r></w:p></w:body></w:document>');
@@ -75,4 +86,3 @@ test('renderDocxTemplate preserves leading and trailing spaces in field replacem
   assert.match(xml, /<w:fldSimple[^>]*><w:r><w:t>Vostro<\/w:t><\/w:r><\/w:fldSimple>/);
   assert.match(xml, /<w:t xml:space="preserve">a <\/w:t><\/w:r><w:r><w:t>Vostro<\/w:t><\/w:r><w:r><w:t xml:space="preserve"> vantaggio <\/w:t>/);
 });
-

@@ -134,6 +134,12 @@ function normalizeObjectRow(value: unknown): Record<string, unknown> {
 function normalizeExcelValue(v: ExcelJS.CellValue): unknown {
   if (v === null || v === undefined) return '';
   if (typeof v === 'object') {
+    // Formula cells can omit the cached result when Excel has not recalculated
+    // them before saving. A formula object is not a document value.
+    if ('formula' in v) {
+      const result = (v as any).result;
+      return typeof result === 'string' || typeof result === 'number' || typeof result === 'boolean' || result instanceof Date ? result : '';
+    }
     if ('result' in v) return (v as any).result ?? '';
     if ('text' in v && typeof v.text === 'string') return v.text.trim();
     return String((v as any).toString?.() ?? '').trim();

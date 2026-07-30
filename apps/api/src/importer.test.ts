@@ -130,6 +130,22 @@ test('parseImportFileRows on xlsx preserves displayed number and date formats', 
   assert.deepEqual(rows, [{ importo: '3.948,94', data: '16/03/2026', testo: 'ABC', importo_en: '3,661.05', importo_it_locale: '9.106,45', fallback_us: '5.786,27', formula_eur: '5.282,89', data_locale: '17/03/2026' }]);
 });
 
+test('parseImportFileRows treats an uncached Excel formula as an empty value', async () => {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Formula');
+  ws.addRow(['testo']);
+  ws.addRow([{ formula: 'IF(1=0,"x","")' }]);
+  const data = await wb.xlsx.writeBuffer();
+
+  const rows = await parseImportFileRows(
+    'formula.xlsx',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    Buffer.from(data as ArrayBuffer)
+  );
+
+  assert.deepEqual(rows, []);
+});
+
 test('extractSpreadsheetDocumentText on xlsx includes all sheets as document content', async () => {
   const buf = await buildWorkbookBuffer();
 
