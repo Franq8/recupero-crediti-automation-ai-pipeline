@@ -50,6 +50,25 @@ test('parseImportFileRows on xlsx uses only first sheet by default', async () =>
   assert.deepEqual(rows, [{ nome: 'Mario Rossi', importo: '100' }]);
 });
 
+test('parseImportFileRows on a formatted xlsx skips title rows before the table headers', async () => {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Dati');
+  ws.addRow(['RIEPILOGO PRATICHE']);
+  ws.addRow(['Documento di lavoro', 'Documento di lavoro']);
+  ws.addRow(['GRUPPO A', 'GRUPPO A', 'GRUPPO B']);
+  ws.addRow(['Debitore', 'Annata', 'Totale dovuto']);
+  ws.addRow(['Mario Rossi', '2024', '100,00']);
+  const data = await wb.xlsx.writeBuffer();
+
+  const rows = await parseImportFileRows(
+    'formatted.xlsx',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    Buffer.from(data as ArrayBuffer)
+  );
+
+  assert.deepEqual(rows, [{ Debitore: 'Mario Rossi', Annata: '2024', 'Totale dovuto': '100,00' }]);
+});
+
 test('parseImportFileRows on xlsx accepts prefixed spreadsheet namespace files', async () => {
   const buf = await rewriteSpreadsheetXmlWithXPrefix(await buildWorkbookBuffer());
 

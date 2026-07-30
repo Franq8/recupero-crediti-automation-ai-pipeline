@@ -1,7 +1,6 @@
 #!/usr/bin/env node
-import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
+import { loadDiscordBotToken } from './lib/openclaw-discord-token.mjs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseImportFileRows } from '../dist/importer.js';
@@ -9,7 +8,6 @@ import { analyzeStructuredBatchRows } from '../dist/doc-generator-openclaw.js';
 import { extractTemplateInstructions } from '../dist/template-instructions.js';
 
 const execFileAsync = promisify(execFile);
-const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG_PATH || path.join(os.homedir(), '.openclaw', 'openclaw.json');
 const DEFAULT_GUILD_ID = '1465850645138637018';
 const DEFAULT_CHANNEL_ID = '1482018084020551883';
 const DEFAULT_API_BASE = process.env.DOC_GENERATOR_API_BASE || 'https://automazionerecuperi.lawlabs.cloud/api';
@@ -24,12 +22,7 @@ const OPENCLAW_ROWS_PER_PROMPT = Math.max(1, Number.parseInt(process.env.DOC_GEN
 const CHANNEL_ID = process.env.DOC_GENERATOR_CHANNEL_ID || DEFAULT_CHANNEL_ID;
 const GUILD_ID = process.env.DOC_GENERATOR_GUILD_ID || DEFAULT_GUILD_ID;
 
-function loadToken() {
-  const raw = fs.readFileSync(OPENCLAW_CONFIG_PATH, 'utf8');
-  const json = JSON.parse(raw);
-  return json?.channels?.discord?.token || '';
-}
-const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || loadToken();
+const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || loadDiscordBotToken();
 if (!BOT_TOKEN) throw new Error('Missing Discord bot token');
 
 const AttachmentKind = { TEMPLATE: 'template', TABLE: 'table' };

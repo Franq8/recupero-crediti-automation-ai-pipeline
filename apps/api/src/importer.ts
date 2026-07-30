@@ -336,14 +336,14 @@ function parseDelimitedTextRows(text: string): Record<string, unknown>[] {
 }
 
 function parseWorksheetRows(ws: ExcelJS.Worksheet): Record<string, unknown>[] {
-  const headerRow = ws.getRow(1);
+  const headerRow = findHeaderRow(ws);
   const headers: string[] = [];
   headerRow.eachCell((cell, col) => {
     headers[col - 1] = String(cell.value ?? '').trim();
   });
 
   const out: Record<string, unknown>[] = [];
-  for (let rowNum = 2; rowNum <= ws.rowCount; rowNum++) {
+  for (let rowNum = headerRow.number + 1; rowNum <= ws.rowCount; rowNum++) {
     const valueRow = ws.getRow(rowNum);
     const row: Record<string, unknown> = {};
     headers.forEach((key, idx) => {
@@ -355,4 +355,26 @@ function parseWorksheetRows(ws: ExcelJS.Worksheet): Record<string, unknown>[] {
   }
 
   return out;
+}
+
+function findHeaderRow(ws: ExcelJS.Worksheet): ExcelJS.Row {
+  const firstRow = ws.getRow(1);
+  const scanUntil = Math.min(ws.rowCount, 20);
+  const columnCount = Math.max(ws.columnCount, ...Array.from({ length: scanUntil }, (_, idx) => ws.getRow(idx + 1).cellCount));
+  const firstValues = Array.from({ length: columnCount }, (_, idx) => String(firstRow.getCell(idx + 1).value ?? '').trim()).filter(Boolean);
+
+  // Preserve ordinary one-column imports. For wide, presentation-style sheets,
+  // a single title cell in row 1 is not a table header: look for the first row
+  // with several distinct labels near the top of the sheet.
+  if (columnCount <= 1 || firstValues.length > 1) return firstRow;
+
+  const minimumDistinctLabels = Math.max(3, Math.ceil(columnCount * 0.25));
+  for (let rowNum = 2; rowNum <= scanUntil; rowNum++) {
+    const candidate = ws.getRow(rowNum);
+    const labels = Array.from({ length: columnCount }, (_, idx) => String(candidate.getCell(idx + 1).value ?? '').trim()).filter(Boolean);
+    const distinctLabels = new Set(labels.map((label) => label.toLocaleLowerCase('it-IT')));
+    if (distinctLabels.size >= minimumDistinctLabels) return candidate;
+  }
+
+  return firstRow;
 }
