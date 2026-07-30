@@ -21,6 +21,7 @@ const OPENCLAW_ROW_CONCURRENCY = Math.max(1, Number.parseInt(process.env.DOC_GEN
 const OPENCLAW_ROWS_PER_PROMPT = Math.max(1, Number.parseInt(process.env.DOC_GENERATOR_OPENCLAW_ROWS_PER_PROMPT || '25', 10) || 25);
 const CHANNEL_ID = process.env.DOC_GENERATOR_CHANNEL_ID || DEFAULT_CHANNEL_ID;
 const GUILD_ID = process.env.DOC_GENERATOR_GUILD_ID || DEFAULT_GUILD_ID;
+const FORCE_REPROCESS = process.env.DOC_GENERATOR_FORCE_REPROCESS === '1';
 
 const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || loadDiscordBotToken();
 if (!BOT_TOKEN) throw new Error('Missing Discord bot token');
@@ -133,7 +134,8 @@ async function main() {
   const namingPattern = String(message.content || '').trim();
   const rowFlowResults = await computeSpecialPlaceholderRowResults({ templateBytes, tableBytes, tableFilename: table.filename, tableMimeType: table.contentType });
   const form = new FormData();
-  form.set('actor', `discord-doc-generator:main-flow:${message.author?.username || 'unknown'}:${message.id}`);
+  const actor = `discord-doc-generator:main-flow:${message.author?.username || 'unknown'}:${message.id}`;
+  form.set('actor', FORCE_REPROCESS ? `${actor}:retry:${Date.now()}` : actor);
   if (namingPattern) form.set('namingPattern', namingPattern);
   if (rowFlowResults) form.set('openclawRowFlowResultsJson', JSON.stringify(rowFlowResults));
   form.set('async', 'true');
