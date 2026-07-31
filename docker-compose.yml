@@ -10,7 +10,7 @@ services:
       DISCORD_DOWNLOAD_STORAGE_DIR: ${DISCORD_DOWNLOAD_STORAGE_DIR:-/data/discord-downloads}
       DISCORD_OPERATIVE_CHANNEL_ID: ${DISCORD_OPERATIVE_CHANNEL_ID:-1471526846259527725}
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
     volumes:
       - rca_data:/data
 
@@ -21,7 +21,7 @@ services:
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:80"
     depends_on:
       - api
 
