@@ -120,6 +120,22 @@ export function resolveDiscordV1OutputFilename(input: {
   return `${rendered}${extension || '.docx'}`;
 }
 
+/**
+ * The persisted row is intentionally limited to fields used by the DOCX
+ * template. Filename patterns, however, may reference an import-only column.
+ * Keep those source values available for naming without changing the template
+ * comparison or document-rendering data.
+ */
+export function buildDiscordV1NamingRowValues(input: {
+  sourceRow?: Record<string, unknown> | null;
+  generatedRow?: Record<string, unknown> | null;
+}) {
+  return {
+    ...(input.sourceRow ?? {}),
+    ...(input.generatedRow ?? {})
+  };
+}
+
 export function buildDiscordV1ReportMarkdown(input: {
   practiceId: string;
   templateFilename: string;

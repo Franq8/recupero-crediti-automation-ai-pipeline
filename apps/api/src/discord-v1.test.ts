@@ -4,6 +4,7 @@ import JSZip from 'jszip';
 import {
   buildDiscordV1FallbackFilename,
   buildDiscordV1FinalSummary,
+  buildDiscordV1NamingRowValues,
   buildDiscordV1ReportMarkdown,
   buildDiscordV1SummaryCsv,
   buildDiscordV1Zip,
@@ -21,6 +22,22 @@ test('resolveDiscordV1OutputFilename applies naming pattern placeholders and pre
   });
 
   assert.equal(filename, 'Diffida Condifesa-Mario Rossi.docx');
+});
+
+test('filename patterns retain import-only columns that are not DOCX placeholders', () => {
+  const rowValues = buildDiscordV1NamingRowValues({
+    sourceRow: { 'Nome breve destinatario': 'Mario Rossi' },
+    generatedRow: { 'Numero D.I.': '123/2026' }
+  });
+
+  const filename = resolveDiscordV1OutputFilename({
+    templateFilename: 'istanza.docx',
+    rowIndex: 1,
+    namingPattern: '492 bis - {Nome breve destinatario}',
+    rowValues
+  });
+
+  assert.equal(filename, '492 bis - Mario Rossi.docx');
 });
 
 test('buildDiscordV1FallbackFilename uses stable standard naming', () => {

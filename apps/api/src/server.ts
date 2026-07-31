@@ -21,6 +21,7 @@ import {
 import { runOpenClawPipeline } from './openclaw-runner.js';
 import {
   buildDiscordV1FinalSummary,
+  buildDiscordV1NamingRowValues,
   buildDiscordV1ReportMarkdown,
   buildDiscordV1SummaryCsv,
   buildDiscordV1Zip,
@@ -175,6 +176,7 @@ async function executeDiscordV1Autocontinue(input: DiscordAutocontinueExecutionI
 
   const templateStructure = await buildTemplateTableStructure(Buffer.from(template.bytes));
   const templateDrivenKeys = templateStructure.headers.filter((key) => key !== 'row_id');
+  const sourceRowsByIndex = new Map<number, Record<string, unknown>>();
   const projectImportedRowToTemplate = (row: Record<string, unknown>) => {
     const normalized = normalizeImportRow(row);
     return Object.fromEntries(templateDrivenKeys.map((key) => [key, normalized[key] ?? ''])) as Record<string, unknown>;
@@ -185,6 +187,7 @@ async function executeDiscordV1Autocontinue(input: DiscordAutocontinueExecutionI
     const sourceRow = importedRows[idx] as Record<string, unknown>;
     const rowIdRaw = sourceRow.row_id;
     const rowIndex = Number.isFinite(Number(rowIdRaw)) ? Number(rowIdRaw) : idx + 1;
+    sourceRowsByIndex.set(rowIndex, normalizeImportRow(sourceRow));
     const projected = projectImportedRowToTemplate(sourceRow);
 
     await prisma.tableRow.upsert({
@@ -387,7 +390,10 @@ async function executeDiscordV1Autocontinue(input: DiscordAutocontinueExecutionI
     const filename = resolveDiscordV1OutputFilename({
       templateFilename: generatedFilename,
       rowIndex,
-      rowValues,
+      rowValues: buildDiscordV1NamingRowValues({
+        sourceRow: sourceRowsByIndex.get(rowIndex),
+        generatedRow: rowValues
+      }),
       namingPattern,
       practiceId,
       fallbackPrefix: 'doc-generator'
